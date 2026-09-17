@@ -5,7 +5,8 @@ exists for that site, instead of a hardcoded list of radar moments.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -112,11 +113,30 @@ def discover(site: str, day: date, cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_pr
                 log_scale=cont.log_scale if cont else False,
             ))
         ds.close()
+    catalog = _disambiguate_labels(catalog)
     # 2D (time, height) curtains before 1D (time)-only series, so the more
     # commonly wanted moments/curtains aren't buried under LWP-style
     # metadata variables (site altitude, latitude, etc.) that also qualify
     # as "time-only" and would otherwise interleave alphabetically.
     return sorted(catalog, key=lambda p: (p.height_dim is None, p.label))
+
+
+def _disambiguate_labels(catalog: list[ProductVariable]) -> list[ProductVariable]:
+    """CloudnetPy sometimes gives several distinct variables of the same
+    product the exact same long_name -- e.g. the lidar product's beta_raw
+    (non-screened), beta (SNR-screened) and beta_smooth (screened + Gaussian-
+    smoothed) all carry long_name "Attenuated backscatter coefficient"; the
+    only place that distinction lives is each variable's own `comment`
+    attribute, which this app never reads, and its var_name. Without this,
+    the dropdown -- and every plot title, hover, and curve label built from
+    ProductVariable.label -- would show three identical, unpickable entries.
+    So append the variable's own name wherever a label collides with
+    another's within the same instrument."""
+    counts = Counter((pv.instrument_id, pv.label) for pv in catalog)
+    return [
+        replace(pv, label=f"{pv.label} [{pv.var_name}]") if counts[(pv.instrument_id, pv.label)] > 1 else pv
+        for pv in catalog
+    ]
 
 
 @lru_cache(maxsize=32)

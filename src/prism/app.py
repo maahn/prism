@@ -16,7 +16,7 @@ import numpy as np
 import panel as pn
 import param
 from bokeh.models import (
-    AllLabels, CustomJSHover, CustomJSTickFormatter, FixedTicker,
+    AllLabels, CustomJSHover, CustomJSTickFormatter, FixedTicker, LinearAxis, LinearScale, Range1d,
 )
 from holoviews.plotting.util import process_cmap
 
@@ -693,15 +693,13 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
         return _no_data_moment(state, f"{pv.label} (no data this hour)", index=index)
 
     is_timeseries = height_arr is None
-    series_range = None
     if is_timeseries:
-        finite = values[np.isfinite(values)]
-        series_range = (float(finite.min()), float(finite.max())) if finite.size else None
         # Time-only products (e.g. MWR's LWP) are drawn by _moment_curve
-        # instead, as a real line plot on its own y-axis -- a "height" isn't
-        # a meaningful axis for them at all. This image is just an invisible
-        # placeholder (see _moment_curve for why the panel still needs one:
-        # a DynamicMap's own frames must always be the same element type).
+        # instead, as a real line plot on its own right-hand axis (see
+        # _make_curve_axis_hook) -- a "height" isn't a meaningful axis for
+        # them at all. This image is just an invisible placeholder (see
+        # _moment_curve for why the panel still needs one: a DynamicMap's
+        # own frames must always be the same element type).
         # It reuses the real height BINS the curtain panels use (not just
         # their two endpoints) because only one of the three row-1 panels'
         # hooks actually performs a given generation's range refit (see
@@ -716,10 +714,6 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
         values = np.full((len(time_arr), len(height_arr)), np.nan)
 
     title = f"{pv.label} ({pv.units})" if pv.units else pv.label
-    if is_timeseries and series_range is not None:
-        # The curve shares the height axis (see _moment_curve for why), so
-        # its real value range can only be shown here in the title.
-        title = f"{title} [{series_range[0]:.3g} – {series_range[1]:.3g}]"
     opts = dict(colorbar=True, colorbar_opts=_panel_colorbar_models(state, index),
                 tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
                 responsive=True, height=260, title=title, apply_ranges=False,
@@ -764,28 +758,86 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
     return hv.Image((time_arr, height_arr, values.T), kdims=["time", "height"], vdims=["value"]).opts(**opts)
 
 
+def _make_curve_axis_hook(state: AppState, choice: "FlyoutSelect"):
+    """Gives the row-1 time-only curve (e.g. MWR's LWP) its own right-hand
+    y-axis, scaled to the curve's real data -- entirely independent of the
+    shared "height" axis, so panning/zooming height never distorts it and
+    its true value range is always visible without having to zoom all the
+    way out.
+
+    This is built BY HAND with Bokeh's own extra_y_ranges/add_layout, not
+    via HoloViews' multi_y=True option (which is what the old version of
+    this used). multi_y=True has to be set on the whole Overlay, and doing
+    that silently disables the y coordinate of hv.streams.Tap for every
+    layer in it ("Tap stream parameters ['y'] not yet supported with
+    multi_y=True") -- exactly how every row-1 panel reports the clicked
+    height to the rest of the app. That broke click-to-select-a-spectrum
+    app-wide the one time this used multi_y. Building the extra range/axis
+    directly on the shared Bokeh figure and re-pointing just this curve's
+    own glyph renderer at it (renderer.y_range_name) achieves the same
+    visual result without ever touching the Overlay's axis count, so Tap
+    keeps working normally.
+
+    One catch found only by triggering a SECOND frame (the first render
+    alone doesn't show it): HoloViews' own ElementPlot._update_ranges caches
+    `plot.extra_y_ranges`/`plot.extra_y_scales` into its handles once
+    ANYTHING is present in extra_y_ranges, and on every later frame iterates
+    that dict expecting a matching entry in extra_y_scales for each key --
+    a dict Bokeh does NOT keep in sync with extra_y_ranges on its own, so
+    the manual `fig.extra_y_ranges["ts_value"] = ...` line above must be
+    paired with an explicit `fig.extra_y_scales["ts_value"] = LinearScale()`
+    or the very next click crashes with KeyError('ts_value') deep inside
+    HoloViews, even though the first frame renders fine.
+    """
+    def hook(plot, element):
+        fig = plot.state
+        pv = state.catalog_variable(choice.value)
+        is_timeseries = pv is not None and pv.height_dim is None
+        axis = next((a for a in fig.right if isinstance(a, LinearAxis)
+                     and a.y_range_name == "ts_value"), None)
+        if axis is None:
+            fig.extra_y_ranges["ts_value"] = Range1d(start=0, end=1)
+            fig.extra_y_scales["ts_value"] = LinearScale()
+            axis = LinearAxis(y_range_name="ts_value")
+            fig.add_layout(axis, "right")
+        renderer = plot.handles.get("glyph_renderer")
+        if renderer is not None:
+            renderer.y_range_name = "ts_value"
+        axis.visible = is_timeseries
+        axis.axis_label = (f"{pv.label} ({pv.units})" if is_timeseries and pv.units
+                            else pv.label if is_timeseries else "")
+        rng = fig.extra_y_ranges.get("ts_value")
+        if rng is None or not is_timeseries:
+            return
+        bounds = _element_bounds(element, "ts_value")
+        if bounds is None:
+            return
+        lo, hi = bounds
+        pad = (hi - lo) * 0.05 or 0.5
+        rng.start, rng.end = lo - pad, hi + pad
+    return hook
+
+
 def _no_data_curve():
-    return hv.Curve([], kdims=["time"], vdims=["height"])
+    return hv.Curve([], kdims=["time"], vdims=["ts_value"])
 
 
 def _moment_curve(state: AppState, catalog_id):
     """The line-plot counterpart to _moment_image, for time-only variables
-    (e.g. MWR's LWP). Always part of the row-1 Overlay, but empty (draws
-    nothing) whenever the current variable is a real 2D curtain instead --
-    this DynamicMap's own frames must always be the same element type (a
-    Curve, just sometimes an empty one), exactly like image_dmap's own
-    placeholder handling.
+    (e.g. MWR's LWP): a real hv.Curve on its own right-hand y-axis (see
+    _make_curve_axis_hook), since a 1D time series has no natural
+    relationship to the shared "height" axis the other two elements use.
+    Always part of the row-1 Overlay, but empty (draws nothing) whenever the
+    current variable is a real 2D curtain instead -- this DynamicMap's own
+    frames must always be the same element type (a Curve, just sometimes an
+    empty one), exactly like image_dmap's own placeholder handling.
 
-    A 1D time series has no natural relationship to the shared "height"
-    axis, so the curve is NORMALISED onto it and its true value range is
-    written into the panel title by _moment_image instead. The obvious
-    alternative -- giving the curve its own right-hand axis via multi_y=True
-    on the Overlay -- is not available: multi_y silently disables the y
-    coordinate of hv.streams.Tap ("Tap stream parameters ['y'] not yet
-    supported with multi_y=True"), which is exactly how every panel reports
-    the clicked height to the rest of the app. Enabling it broke
-    click-to-select-a-spectrum app-wide, including on the two curtain panels
-    that were never meant to show a curve at all.
+    Deliberately does NOT set apply_ranges=False: unlike the shared
+    time/height axes, this curve's own value axis never needs zoom
+    preserved across clicks (its streams don't include
+    selected_time/selected_height, so a click never re-renders it at all --
+    only an hour or variable change does, and both of those SHOULD refit
+    this axis to the new data's real range).
     """
     pv = state.catalog_variable(catalog_id)
     if pv is None or pv.height_dim is not None or state.spectra is None:
@@ -794,19 +846,7 @@ def _moment_curve(state: AppState, catalog_id):
     time_arr, _, values = gp.load_curtain(pv, t0, t1)
     if len(time_arr) == 0:
         return _no_data_curve()
-    heights = state.spectra.height
-    h0, h1 = float(np.min(heights)), float(np.max(heights))
-    values = np.asarray(values, dtype=float)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return _no_data_curve()
-    lo, hi = float(finite.min()), float(finite.max())
-    span = hi - lo
-    # Keep the curve inside the middle 90% of the panel so its extremes
-    # aren't clipped against the frame; a constant series sits mid-panel.
-    frac = 0.5 if span == 0 else (values - lo) / span
-    scaled = h0 + (0.05 + 0.9 * frac) * (h1 - h0)
-    return hv.Curve((time_arr, scaled), kdims=["time"], vdims=["height"]).opts(
+    return hv.Curve((time_arr, values), kdims=["time"], vdims=["ts_value"]).opts(
         color="darkorange", line_width=2)
 
 
@@ -826,28 +866,42 @@ def build_spectra_controls(state: AppState):
 def _no_data_range_spectrogram():
     img = hv.Image((np.array([-1.0, 1.0]), np.array([0.0, 1.0]), np.full((2, 2), np.nan)),
                     kdims=["velocity", "height"], vdims=["power"]).opts(
-        cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False)
-    return hv.Overlay([img]).opts(responsive=True, height=280, apply_ranges=False,
-                                   title="Range spectrogram (no data)")
+        cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False,
+        responsive=True, height=280, title="Range spectrogram (no data)",
+        xlabel="Doppler velocity (m/s)", ylabel="height (m)")
+    return hv.Overlay([img])
 
 
 def _range_spectrogram(state: AppState, channel: str):
     """Content legitimately changes on every click (a different time's
-    profile); the axes are managed by _make_range_hook, not by HoloViews."""
+    profile); the axes are managed by _make_range_hook, not by HoloViews.
+
+    title/height/responsive/apply_ranges/xlabel/ylabel are set on each
+    per-chirp Image itself, NOT on the returned Overlay -- an Overlay's own
+    .opts() are tied to that specific Overlay object's id, and this
+    function's caller multiplies the result by a marker-line DynamicMap
+    (see _range_height_marker), which builds a brand-new Overlay on every
+    frame and silently drops any option that lived only on the old one.
+    Concretely, that previously lost the title AND apply_ranges=False
+    (which is what kept a click from resetting the user's zoom) the moment
+    the marker line was added -- HoloViews' own per-ELEMENT options survive
+    that recombination, so they belong here instead, exactly like
+    _moment_image/_time_spectrogram already do.
+    """
     s = state.spectra
     if s is None or state.selected_time is None:
         return _no_data_range_spectrogram()
     t_idx = s.nearest_time_index(state.selected_time)
     segments = s.range_profile_segments(t_idx, channel)
+    title = f"Range spectrogram ({channel})"
     images = [
         hv.Image((vel, s.height[rng_slice], block), kdims=["velocity", "height"], vdims=["power"]).opts(
-            cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False)
+            cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False,
+            responsive=True, height=280, title=title,
+            xlabel="Doppler velocity (m/s)", ylabel="height (m)")
         for rng_slice, vel, block in segments
     ]
-    return hv.Overlay(images).opts(
-        responsive=True, height=280, title=f"Range spectrogram ({channel})", apply_ranges=False,
-        xlabel="Doppler velocity (m/s)", ylabel="height (m)",
-    )
+    return hv.Overlay(images)
 
 
 def _no_data_time_spectrogram(state: AppState):
@@ -878,6 +932,30 @@ def _time_spectrogram(state: AppState, channel: str):
         title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)",
     )
+
+
+def _range_height_marker(state: AppState):
+    """A red line across the range spectrogram at the currently selected
+    height, so it's visible which profile row the single spectrum panel is
+    showing. Always an HLine (never a differently-shaped placeholder) so
+    this DynamicMap's frames stay one element type; when nothing is
+    selected yet it's just made fully transparent rather than omitted.
+    HLine has no "height"/"velocity" dim of its own, so overlaying it never
+    perturbs _make_range_hook's element.range(...) computation (verified:
+    only the Image layers contribute to that)."""
+    y = state.selected_height if state.selected_height is not None else 0
+    alpha = 1.0 if state.selected_height is not None else 0.0
+    return hv.HLine(y).opts(color="red", line_width=1.5, line_alpha=alpha, apply_ranges=False)
+
+
+def _time_selected_marker(state: AppState):
+    """Same as _range_height_marker, but a vertical line on the time
+    spectrogram at the currently selected time."""
+    if state.selected_time is None:
+        x, alpha = 0, 0.0
+    else:
+        x, alpha = np.datetime64(int(state.selected_time), "s"), 1.0
+    return hv.VLine(x).opts(color="red", line_width=1.5, line_alpha=alpha, apply_ranges=False)
 
 
 def _no_data_spectrum():
@@ -1091,7 +1169,15 @@ def build_app() -> pn.template.BaseTemplate:
 
     prev_btn.on_click(step_hour(-1))
     next_btn.on_click(step_hour(1))
-    reset_all_btn.on_click(lambda e: (settings.reset_all(), pn.state.location.reload()))
+    def do_reset_all(event):
+        settings.reset_all()
+        # Location.reload is a Boolean param, not a method -- setting it
+        # True is what actually tells the browser to reload (calling it as
+        # reload() raises "'bool' object is not callable", since that's
+        # exactly what the attribute already is).
+        pn.state.location.reload = True
+
+    reset_all_btn.on_click(do_reset_all)
 
     def do_clean_cache(event):
         status.object = "Clearing cache..."
@@ -1162,13 +1248,13 @@ def build_app() -> pn.template.BaseTemplate:
             lambda **_kw: _moment_marker(state),
             streams=[hv.streams.Params(state, ["selected_time", "selected_height"])],
         )
-        # A time-only variable (e.g. MWR's LWP) is drawn by this Curve,
-        # normalised onto the shared "height" axis -- NOT via multi_y, which
-        # would break Tap's y coordinate for every panel (see _moment_curve).
+        # A time-only variable (e.g. MWR's LWP) is drawn by this Curve on its
+        # own right-hand y-axis, built by hand rather than via multi_y (see
+        # _make_curve_axis_hook for why).
         curve_dmap = hv.DynamicMap(make_curve_callback(), streams=[
             param_stream(choice, "value", f"curve_var{i}"),
             hv.streams.Params(state, ["hour_index", "range_generation"]),
-        ])
+        ]).opts(hv.opts.Curve(hooks=[_make_curve_axis_hook(state, choice)]))
         tap.add_subscriber(on_tap_factory(i))
         row1_dmaps.append((image_dmap * marker_dmap * curve_dmap).opts(
             hv.opts.Overlay(apply_ranges=False,
@@ -1186,17 +1272,30 @@ def build_app() -> pn.template.BaseTemplate:
     # auto_y=True where the y axis SHOULD refit on every update: the time
     # spectrogram's velocity axis changes with the selected chirp, and the
     # spectrum's power axis would otherwise clip later spectra off-scale.
-    range_dmap = hv.DynamicMap(
+    # Each spectrogram's selection-marker line is its OWN DynamicMap (like
+    # row1's _moment_marker) so moving the crosshair doesn't force a re-fetch
+    # of the whole spectrogram image -- only _range_cb/_time_cb's own streams
+    # (selected_time / selected_height respectively, since that picks WHICH
+    # profile is shown) do that.
+    range_marker_dmap = hv.DynamicMap(
+        lambda **_kw: _range_height_marker(state),
+        streams=[hv.streams.Params(state, ["selected_height"])],
+    )
+    time_marker_dmap = hv.DynamicMap(
+        lambda **_kw: _time_selected_marker(state),
+        streams=[hv.streams.Params(state, ["selected_time"])],
+    )
+    range_dmap = (hv.DynamicMap(
         _range_cb,
         streams=[param_stream(channel_toggle, "value", "ch_range"),
                  hv.streams.Params(state, ["hour_index", "selected_time", "range_generation"])],
-    ).opts(hv.opts.Overlay(apply_ranges=False,
+    ) * range_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "height")]))
-    time_dmap = hv.DynamicMap(
+    time_dmap = (hv.DynamicMap(
         _time_cb,
         streams=[param_stream(channel_toggle, "value", "ch_time"),
                  hv.streams.Params(state, ["hour_index", "selected_height", "range_generation"])],
-    ).opts(hv.opts.Image(apply_ranges=False,
+    ) * time_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                           hooks=[_make_range_hook(state, "time", "velocity", auto_y=True)]))
     spectrum_dmap = hv.DynamicMap(
         _spectrum_cb,
