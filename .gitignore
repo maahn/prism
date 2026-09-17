@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.DS_Store
+
+# Local dev/test artifacts -- a personal cache dir and Claude Code's local
+# dev-server launch config (hardcodes an absolute path), not part of the
+# distributed package.
+.cache/
+.claude/
+
+# Default runtime cache/settings locations, in case they're ever created
+# inside the repo instead of under $HOME.
+.config/

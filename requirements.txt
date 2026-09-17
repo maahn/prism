@@ -1,0 +1,15 @@
+requests
+numpy
+xarray
+netCDF4
+rpgpy
+zarr
+holoviews
+# panel and bokeh are pinned together deliberately: panel bundles its own
+# BokehJS build, and if the installed `bokeh` python package is newer than
+# what that panel version bundles, the browser and server speak mismatched
+# protocol versions -- click/tap/hover events silently stop reaching the
+# server with no visible error. Bump both together, deliberately, and
+# re-verify interactivity after.
+panel==1.9.4
+bokeh==3.8.2
