@@ -54,10 +54,15 @@ def discover(site: str, day: date, cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_pr
     remotes = [r for r in cc.list_product_files(site, day) if r.product_id in CANDIDATE_PRODUCTS]
     catalog: list[ProductVariable] = []
     for remote in remotes:
-        path = cc.ensure_downloaded(remote, cache_dir, on_progress=on_progress)
         try:
+            path = cc.ensure_downloaded(remote, cache_dir, on_progress=on_progress)
             ds = xr.open_dataset(path)
         except Exception:
+            # A single flaky/oversized curtain-product download (or a file
+            # that fails to parse) shouldn't abort discovery of every OTHER
+            # product for this site/day -- skip it and keep going, the same
+            # way a missing hour or variable degrades gracefully elsewhere
+            # in this app rather than blocking the whole load.
             continue
         # Multi-instrument sites can publish the same product (e.g. "radar")
         # from more than one instrument -- group by the actual instrument so
@@ -73,8 +78,22 @@ def discover(site: str, day: date, cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_pr
                 pass  # a genuine (time, height) curtain
             elif da.ndim == 1 and da.dims == ("time",):
                 height_dim = None  # time-only series, e.g. mwr lwp
+                # Skip site metadata masquerading as a "time series" (site
+                # altitude/latitude/longitude, instrument constants, etc.):
+                # cheap since these are small 1D arrays already in memory,
+                # and worth it since they'd otherwise clutter the dropdown
+                # with entries that are never worth looking at as a curve.
+                vals = da.values
+                finite = vals[np.isfinite(vals)] if np.issubdtype(vals.dtype, np.floating) else vals
+                if finite.size and np.all(finite == finite.flat[0]):
+                    continue
             else:
                 continue
+            # No dimension suffix here -- this label is reused for plot
+            # titles, the categorical legend, and the curve y-axis label,
+            # where it would just be noise. app._nested_options() appends
+            # "(time, height)"/"(time)" only for the dropdown's own display
+            # text.
             label = f"{remote.product_id}: {da.attrs.get('long_name', var_name)}"
             is_categorical = var_name in plot_meta.CATEGORICAL
             cont = plot_meta.CONTINUOUS.get(var_name)
@@ -93,7 +112,11 @@ def discover(site: str, day: date, cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_pr
                 log_scale=cont.log_scale if cont else False,
             ))
         ds.close()
-    return sorted(catalog, key=lambda p: p.label)
+    # 2D (time, height) curtains before 1D (time)-only series, so the more
+    # commonly wanted moments/curtains aren't buried under LWP-style
+    # metadata variables (site altitude, latitude, etc.) that also qualify
+    # as "time-only" and would otherwise interleave alphabetically.
+    return sorted(catalog, key=lambda p: (p.height_dim is None, p.label))
 
 
 @lru_cache(maxsize=32)

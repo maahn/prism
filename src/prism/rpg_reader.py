@@ -25,27 +25,40 @@ import zarr
 RPG_EPOCH_OFFSET = 978307200
 
 # dB quantization: code 0 is reserved for "no signal"/masked. Codes 1..255
-# cover DB_OFFSET .. DB_OFFSET + 254*DB_SCALE. Measured spectral dynamic range
-# is about -69..-9 dB, so this leaves comfortable headroom at 0.3 dB steps
-# (max quantization error 0.15 dB, far below radar calibration uncertainty).
+# cover DB_OFFSET .. DB_OFFSET + 254*DB_SCALE. These defaults suit the
+# RPG-FMCW-94, whose measured spectral dynamic range is about -69..-9 dB, at
+# 0.3 dB steps (max quantization error 0.15 dB, far below radar calibration
+# uncertainty).
+#
+# They are only DEFAULTS: instruments report spectral power in their own
+# units, and METEK's MIRA sits roughly 75 dB lower, so writers pass their own
+# window (see mira_reader.decide_db_window) and record it in the zarr's
+# attributes. Caches written before that existed carry no attributes, hence
+# the fallback in db_window_of().
 DB_OFFSET = -75.0
 DB_SCALE = 0.3
 MASK_CODE = 0
 
 
-def _encode_db(linear_power: np.ndarray) -> np.ndarray:
+def _encode_db(linear_power: np.ndarray, offset: float = DB_OFFSET, scale: float = DB_SCALE) -> np.ndarray:
     with np.errstate(divide="ignore", invalid="ignore"):
         db = 10 * np.log10(linear_power)
-    code = np.round((db - DB_OFFSET) / DB_SCALE)
+    code = np.round((db - offset) / scale)
     code = np.clip(code, 1, 255)
     valid = np.isfinite(db) & (linear_power > 0)
     return np.where(valid, code, MASK_CODE).astype("uint8")
 
 
-def _decode_db(codes: np.ndarray) -> np.ndarray:
-    db = codes.astype("float32") * DB_SCALE + DB_OFFSET
+def _decode_db(codes: np.ndarray, offset: float = DB_OFFSET, scale: float = DB_SCALE) -> np.ndarray:
+    db = codes.astype("float32") * scale + offset
     db[codes == MASK_CODE] = np.nan
     return db
+
+
+def db_window_of(store) -> tuple[float, float]:
+    """The (offset, scale) a decoded zarr was quantized with."""
+    return (float(store.attrs.get("db_offset", DB_OFFSET)),
+            float(store.attrs.get("db_scale", DB_SCALE)))
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,7 @@ class SpectraHour:
 
     def __init__(self, zarr_path: Path):
         self._store = zarr.open_group(str(zarr_path), mode="r")
+        self._db_offset, self._db_scale = db_window_of(self._store)
         self.time = self._store["time"][:]  # unix seconds, int64
         self.height = self._store["height"][:]
         self.chirp = ChirpTable(
@@ -135,6 +149,9 @@ class SpectraHour:
             velocity_vectors=self._store["velocity_vectors"][:],
         )
         self.n_time, self.n_range, self.n_doppler = self._store["co_byTime"].shape
+
+    def _decode(self, codes: np.ndarray) -> np.ndarray:
+        return _decode_db(codes, self._db_offset, self._db_scale)
 
     def nearest_time_index(self, unix_time: float) -> int:
         return int(np.searchsorted(self.time, unix_time))
@@ -148,7 +165,7 @@ class SpectraHour:
         sl = self.chirp.valid_slice(c)
         codes = self._store[f"{channel}_byRange"][time_idx, range_idx, sl]
         vel = self.chirp.velocity_axis(range_idx)
-        return vel, _decode_db(codes)
+        return vel, self._decode(codes)
 
     def range_profile_segments(self, time_idx: int, channel: str = "co"):
         """Spectrum-vs-range at one time step (dB), split by chirp segment.
@@ -166,7 +183,7 @@ class SpectraHour:
             sl = self.chirp.valid_slice(c)
             codes = arr[time_idx, start:stop, sl]
             vel = self.chirp.velocity_axis(start)
-            segments.append((slice(start, stop), vel, _decode_db(codes)))
+            segments.append((slice(start, stop), vel, self._decode(codes)))
         return segments
 
     def time_series(self, range_idx: int, t_start: int, t_stop: int, channel: str = "co") -> np.ndarray:
@@ -174,4 +191,4 @@ class SpectraHour:
         c = self.chirp.chirp_for_range_index(range_idx)
         sl = self.chirp.valid_slice(c)
         codes = self._store[f"{channel}_byRange"][t_start:t_stop, range_idx, sl]
-        return _decode_db(codes)
+        return self._decode(codes)

@@ -75,6 +75,14 @@ def _is_raw_spectra_file(instrument: str, filename: str) -> bool:
     return False
 
 
+def list_available_instruments(site: str, day: date) -> list[str]:
+    """Which of RAW_SPECTRA_INSTRUMENTS actually published usable raw
+    spectra for this site/day -- so the instrument picker can offer only
+    what's real instead of a fixed list that's mostly "(no data)" at most
+    sites. Cheap: metadata-only listing calls, no file downloads."""
+    return [i for i in RAW_SPECTRA_INSTRUMENTS if list_raw_spectra_files(site, day, i)]
+
+
 def list_raw_spectra_files(site: str, day: date, instrument: str = "rpg-fmcw-94") -> list[RemoteFile]:
     """List raw Doppler-spectra files available for one day."""
     day_str = day.isoformat()

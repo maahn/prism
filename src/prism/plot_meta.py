@@ -185,8 +185,3 @@ CONTINUOUS: dict[str, ContinuousMeta] = {
     "Tw": ContinuousMeta(cmap="RdBu_r", plot_range=(-50, 50)),
     "temperature": ContinuousMeta(cmap="RdBu_r", plot_range=(-50, 50)),
 }
-
-
-def legend_entries(var_name: str) -> list[tuple[str, str]]:
-    """Visible (non-underscore-prefixed) (label, color) pairs for a categorical variable."""
-    return [(label, color) for label, color in CATEGORICAL.get(var_name, ()) if not label.startswith("_")]
