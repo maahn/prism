@@ -36,7 +36,7 @@ hv.extension("bokeh")
 hv.config.image_rtol = 0.5
 
 N_MOMENT_PANELS = 3
-DEFAULT_PANEL_VARIABLES = ["radar:Zh", "radar:v", "radar:width"]
+DEFAULT_PANEL_VARIABLES = ["categorize:Z", "categorize:v", "categorize:width"]
 
 
 def to_datetime64(x) -> np.datetime64:
@@ -79,6 +79,10 @@ class AppState(param.Parameterized):
         self.channel = settings.get("spectra_channel")
         # Which range_generation each Bokeh range object was last fitted for.
         self.range_keys: dict[str, int] = {}
+        # Which (lo, hi) an auto_y range was last fit to, for _make_range_hook
+        # to detect a genuine natural-extent change (e.g. RPG's chirp
+        # boundary) vs. a plain re-render that shouldn't touch it again.
+        self.auto_bounds: dict[str, tuple[float, float]] = {}
         # Per row-1 panel: the ONE FixedTicker/CustomJSTickFormatter pair its
         # colorbar is built with, kept so hooks can re-point them at the
         # current variable (see _panel_colorbar_models).
@@ -105,7 +109,19 @@ class AppState(param.Parameterized):
         if on_status:
             on_status("Checking available hours and products...")
         self.available_hours = cc.list_raw_spectra_files(self.site, self.day, self.instrument)
-        self.catalog = gp.discover(self.site, self.day, self.cache_dir, on_progress=on_progress)
+        # Only download/scan the products the panels will actually show on
+        # this Load: the defaults, plus whichever product each panel's OWN
+        # persisted choice belongs to (so a returning user's saved variable
+        # shows real data immediately instead of a stub). Every other
+        # available product is listed but not fetched -- see
+        # gp.discover()'s docstring and resolve_variable() below.
+        eager = set(gp.DEFAULT_EAGER_PRODUCTS)
+        for i in range(N_MOMENT_PANELS):
+            stored_id = self.settings.get_panel(i)["variable"]
+            if stored_id and ":" in stored_id:
+                eager.add(stored_id.split(":", 1)[0])
+        self.catalog = gp.discover(self.site, self.day, self.cache_dir,
+                                    on_progress=on_progress, eager_products=eager)
         self.load_hour(on_progress=on_progress, on_status=on_status)
 
     def hours_with_data(self) -> set[int]:
@@ -151,6 +167,20 @@ class AppState(param.Parameterized):
 
     def catalog_variable(self, catalog_id: str) -> gp.ProductVariable | None:
         return next((p for p in self.catalog if p.catalog_id == catalog_id), None)
+
+    def resolve_variable(self, catalog_id: str | None) -> gp.ProductVariable | None:
+        """Like catalog_variable(), but downloads and scans that variable's
+        product FIRST if discover() only offered it as a stub (see
+        gp.DEFAULT_EAGER_PRODUCTS / gp.resolve_product). Only the actual
+        data-loading render functions (_moment_image/_moment_curve) need
+        this -- everything else (colorbar/hover styling, categorical/log
+        flags) only reads metadata that's already correct on a stub, so
+        calling this there would just be a needless download trigger."""
+        pv = self.catalog_variable(catalog_id)
+        if pv is None or pv.file_path is not None:
+            return pv
+        self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir)
+        return self.catalog_variable(catalog_id)
 
     @property
     def hour_time_bounds(self):
@@ -214,9 +244,30 @@ def _make_range_hook(state: AppState, x_dim: str | None, y_dim: str | None, auto
     range is only refitted when that is explicitly bumped after a completed
     load, so clicks leave the current view untouched.
 
-    auto_y=True opts the y axis out of that rule, for axes that SHOULD
-    refit every frame (the single spectrum's power axis, and the time
-    spectrogram's velocity axis, which changes with the selected chirp).
+    auto_y=True opts the y axis out of the generation rule, for axes whose
+    NATURAL extent can change between frames without a generation bump: the
+    single spectrum's power axis (different profile, different dB range
+    every click) and the time spectrogram's velocity axis (RPG-FMCW-94's
+    per-chirp Nyquist velocity, which can differ at the newly clicked
+    height).
+
+    Even so, auto_y does NOT mean "refit unconditionally on every frame" --
+    it refits only when the newly computed bounds actually DIFFER from the
+    last ones this hook fit that same Bokeh range object to (tracked in
+    state.auto_bounds by rng.id). That distinction matters because
+    shared_axes=True unifies a dimension's range across every plot that
+    uses it, by NAME, regardless of whether it's that plot's x or y axis --
+    confirmed empirically: the time spectrogram's "velocity" y_range is
+    THE SAME Bokeh model as the range spectrogram's and single spectrum's
+    "velocity" x_range. Those two are apply_ranges=False and correctly
+    generation-gated, but auto_y unconditionally overwriting the SAME
+    shared object on every click (since selecting a new height always
+    re-renders the time spectrogram) silently threw away the user's zoom
+    on the other two panels every single time -- for MIRA's single-chirp
+    instruments the "natural" bounds never even change, so this was a pure
+    regression with no benefit. Comparing against the last-fit bounds
+    keeps the legitimate RPG chirp-change refit while leaving the shared
+    range alone on every other click.
     """
     def hook(plot, element):
         generation = state.range_generation
@@ -224,10 +275,14 @@ def _make_range_hook(state: AppState, x_dim: str | None, y_dim: str | None, auto
             rng = plot.handles.get(handle)
             if rng is None or dim is None:
                 continue
-            if not always and state.range_keys.get(rng.id) == generation:
-                continue
             bounds = _element_bounds(element, dim)
             if bounds is None:
+                continue
+            if always:
+                if state.auto_bounds.get(rng.id) == bounds:
+                    continue
+                state.auto_bounds[rng.id] = bounds
+            elif state.range_keys.get(rng.id) == generation:
                 continue
             lo, hi = bounds
             rng.start, rng.end = lo, hi
@@ -684,7 +739,7 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
     (in build_app) deliberately do NOT include selected_time/selected_height,
     so clicking to select a point never re-triggers this and never resets
     the axes."""
-    pv = state.catalog_variable(catalog_id)
+    pv = state.resolve_variable(catalog_id)
     if pv is None or state.spectra is None:
         return _no_data_moment(state, index=index)
     t0, t1 = state.hour_time_bounds
@@ -839,7 +894,7 @@ def _moment_curve(state: AppState, catalog_id):
     only an hour or variable change does, and both of those SHOULD refit
     this axis to the new data's real range).
     """
-    pv = state.catalog_variable(catalog_id)
+    pv = state.resolve_variable(catalog_id)
     if pv is None or pv.height_dim is not None or state.spectra is None:
         return _no_data_curve()
     t0, t1 = state.hour_time_bounds

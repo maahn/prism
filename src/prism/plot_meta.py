@@ -139,6 +139,7 @@ CATEGORICAL: dict[str, tuple[tuple[str, str], ...]] = {
 
 CONTINUOUS: dict[str, ContinuousMeta] = {
     "Zh": ContinuousMeta(plot_range=(-40, 15)),
+    "Z": ContinuousMeta(plot_range=(-40, 15)),  # categorize's own name for radar reflectivity
     "ldr": ContinuousMeta(plot_range=(-30, -5)),
     "width": ContinuousMeta(plot_range=(1e-2, 1e0), log_scale=True),
     "v": ContinuousMeta(cmap="RdBu_r", plot_range=(-4, 4)),
