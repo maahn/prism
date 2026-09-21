@@ -921,8 +921,8 @@ def build_spectra_controls(state: AppState):
 def _no_data_range_spectrogram():
     img = hv.Image((np.array([-1.0, 1.0]), np.array([0.0, 1.0]), np.full((2, 2), np.nan)),
                     kdims=["velocity", "height"], vdims=["power"]).opts(
-        cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False,
-        responsive=True, height=280, title="Range spectrogram (no data)",
+        cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
+        apply_ranges=False, responsive=True, height=280, title="Range spectrogram (no data)",
         xlabel="Doppler velocity (m/s)", ylabel="height (m)")
     return hv.Overlay([img])
 
@@ -941,7 +941,9 @@ def _range_spectrogram(state: AppState, channel: str):
     (which is what kept a click from resetting the user's zoom) the moment
     the marker line was added -- HoloViews' own per-ELEMENT options survive
     that recombination, so they belong here instead, exactly like
-    _moment_image/_time_spectrogram already do.
+    _moment_image/_time_spectrogram already do. Same reasoning applies to
+    "tap": without it in `tools`, Bokeh never attaches a TapTool to this
+    figure at all, so clicking here did nothing.
     """
     s = state.spectra
     if s is None or state.selected_time is None:
@@ -951,8 +953,8 @@ def _range_spectrogram(state: AppState, channel: str):
     title = f"Range spectrogram ({channel})"
     images = [
         hv.Image((vel, s.height[rng_slice], block), kdims=["velocity", "height"], vdims=["power"]).opts(
-            cmap="viridis", colorbar=True, tools=["hover"], apply_ranges=False,
-            responsive=True, height=280, title=title,
+            cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
+            apply_ranges=False, responsive=True, height=280, title=title,
             xlabel="Doppler velocity (m/s)", ylabel="height (m)")
         for rng_slice, vel, block in segments
     ]
@@ -965,7 +967,8 @@ def _no_data_time_spectrogram(state: AppState):
     t0, t1 = state.display_time_bounds
     return hv.Image(((t0, t1), np.array([-1.0, 1.0]), np.full((2, 2), np.nan)),
                      kdims=["time", "velocity"], vdims=["power"]).opts(
-        cmap="viridis", colorbar=True, responsive=True, height=280, tools=["hover"],
+        cmap="viridis", colorbar=True, responsive=True, height=280,
+        tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
         title="Time spectrogram (no data)", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)")
 
@@ -974,7 +977,9 @@ def _time_spectrogram(state: AppState, channel: str):
     """Shows the full loaded hour (not a narrow window around the selection)
     so its "time" axis has the same natural extent as the moments panels and
     can be genuinely axis-linked with them, rather than fighting over a
-    shared range at two different intended zoom levels."""
+    shared range at two different intended zoom levels. "tap" must be in
+    `tools` for clicking here to select a time at all -- without it Bokeh
+    never attaches a TapTool to this figure."""
     s = state.spectra
     if s is None or state.selected_height is None:
         return _no_data_time_spectrogram(state)
@@ -983,7 +988,8 @@ def _time_spectrogram(state: AppState, channel: str):
     vel = s.chirp.velocity_axis(r_idx)
     times = np.array([np.datetime64(int(x), "s") for x in s.time])
     return hv.Image((times, vel, block.T), kdims=["time", "velocity"], vdims=["power"]).opts(
-        cmap="viridis", colorbar=True, tools=["hover"], responsive=True, height=280,
+        cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
+        responsive=True, height=280,
         title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)",
     )
@@ -1263,6 +1269,21 @@ def build_app() -> pn.template.BaseTemplate:
             state.selected_height = float(y)
         return on_tap
 
+    def on_tap_range(x, y):
+        # Range spectrogram is velocity-vs-height at the CURRENTLY selected
+        # time -- there's no time axis here to also update, unlike row1's
+        # tap which reports both.
+        if y is None:
+            return
+        state.selected_height = float(y)
+
+    def on_tap_time(x, y):
+        # Time spectrogram is time-vs-velocity at the CURRENTLY selected
+        # height -- symmetric to on_tap_range above.
+        if x is None:
+            return
+        state.selected_time = unix_seconds(to_datetime64(x))
+
     def param_stream(obj, name, unique_key):
         return hv.streams.Params(obj, [name], rename={name: unique_key})
 
@@ -1340,15 +1361,25 @@ def build_app() -> pn.template.BaseTemplate:
         lambda **_kw: _time_selected_marker(state),
         streams=[hv.streams.Params(state, ["selected_time"])],
     )
+    # Tap streams -- like row1's, added purely to route a click through to
+    # state via on_tap_range/on_tap_time; they don't affect what's drawn
+    # (the callback ignores its own x/y and just re-reads current state),
+    # so a click here re-renders the same content, then range_marker_dmap/
+    # time_marker_dmap and the OTHER panels react to the resulting state
+    # change.
+    tap_range = hv.streams.Tap(x=None, y=None)
+    tap_range.add_subscriber(on_tap_range)
+    tap_time = hv.streams.Tap(x=None, y=None)
+    tap_time.add_subscriber(on_tap_time)
     range_dmap = (hv.DynamicMap(
         _range_cb,
-        streams=[param_stream(channel_toggle, "value", "ch_range"),
+        streams=[tap_range, param_stream(channel_toggle, "value", "ch_range"),
                  hv.streams.Params(state, ["hour_index", "selected_time", "range_generation"])],
     ) * range_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "height")]))
     time_dmap = (hv.DynamicMap(
         _time_cb,
-        streams=[param_stream(channel_toggle, "value", "ch_time"),
+        streams=[tap_time, param_stream(channel_toggle, "value", "ch_time"),
                  hv.streams.Params(state, ["hour_index", "selected_height", "range_generation"])],
     ) * time_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                           hooks=[_make_range_hook(state, "time", "velocity", auto_y=True)]))
