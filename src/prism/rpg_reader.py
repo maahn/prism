@@ -109,11 +109,20 @@ def ensure_decoded(lv0_path: Path, cache_dir: Path) -> Path:
 
     header, data = rpgpy.read_rpg(str(lv0_path))
 
-    # RPG's "TotSpec" is co+cross combined power, not co-channel alone; true
-    # co-channel power is TotSpec - HSpec (verified against the
-    # Cloudnet-derived LDR: reconstructing HSpec / (TotSpec - HSpec) matches
-    # the published `ldr` product to within ~0.9 dB MAD).
-    co_db = _encode_db(data["TotSpec"] - data["HSpec"])
+    # RPG-FMCW-94 is a slant-45 STSR (simultaneous transmit/receive) radar:
+    # HSpec is the H-channel power spectrum, and TotSpec is H + V + the
+    # cross term, NOT H + V alone -- so the V-channel ("co", by the same
+    # convention CloudnetPy's own moments use, e.g. Zh) is
+    # TotSpec - HSpec - 2*Re(ReVHSpec), not just TotSpec - HSpec. Missing
+    # that cross-correlation term is a small correction in the well-
+    # detected core of a spectrum (median ~0.1 dB against real data) but
+    # grows to several dB near the noise floor, exactly where a careful
+    # analysis (e.g. spectral LDR/SLDR, per Myagkov/RPG's own published
+    # method) would be most sensitive to it. The channel labeling itself
+    # (HSpec = cross, the derived V-ish quantity = co) was separately
+    # verified against Cloudnet's published `ldr` moment (HSpec / co
+    # matched to within ~0.9 dB MAD) and is unaffected by this correction.
+    co_db = _encode_db(data["TotSpec"] - data["HSpec"] - 2 * data["ReVHSpec"])
     cross_db = _encode_db(data["HSpec"])
     time_unix = data["Time"].astype("int64") + RPG_EPOCH_OFFSET
     del data
