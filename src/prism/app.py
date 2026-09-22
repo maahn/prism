@@ -28,7 +28,19 @@ from prism import plot_meta as pm
 from prism import rpg_reader as rr
 from prism import settings_store as ss
 
-pn.extension()
+pn.extension(raw_css=["""
+    /* A stretch_both/percentage-sized Panel/Bokeh layout only has something
+    real to stretch INTO if its ancestors actually span the viewport --
+    the default HTML body is only as tall as its content, so without this
+    the grid's sizing_mode="stretch_both" (see build_app) has no effect and
+    it just falls back to a fixed default height. Deliberately scoped to
+    just html/body, NOT a blanket rule on every Bokeh row/column -- those
+    stay sized by their own explicit sizing_mode in Python (the top/bottom
+    control bars are meant to stay their natural height, only the grid
+    itself should claim the rest).
+    */
+    html, body { height: 100%; margin: 0; }
+"""])
 hv.extension("bokeh")
 # Radar/height grids are piecewise- rather than perfectly-uniform (chirp
 # boundaries, instrument-specific gate spacing). We deliberately render as a
@@ -666,9 +678,13 @@ def build_moment_controls(state: AppState, index: int):
     grouped = _grouped_options(state.catalog)
     default_id = _default_catalog_id(state.catalog, panel_state["variable"], DEFAULT_PANEL_VARIABLES[index])
 
+    # width is responsive (not fixed), so this grows to fill whatever share
+    # of the row it's given -- lining it up with its panel's column below
+    # even as the window widens, instead of staying a fixed pixel width
+    # while the (also-responsive) grid panels stretch to fill the rest.
     choice = FlyoutSelect(options=grouped, value=default_id,
                            label=_label_for_catalog_id(state.catalog, default_id),
-                           height=32, width=280, margin=(5, 5, 5, 5))
+                           height=32, sizing_mode="stretch_width", margin=(5, 5, 5, 5))
 
     auto_color = panel_state["color_limits"] == "auto"
     vmin_w = pn.widgets.FloatInput(name="color min", value=0.0, disabled=auto_color, width=90)
@@ -723,7 +739,7 @@ def build_moment_controls(state: AppState, index: int):
         auto_w, pn.Row(vmin_w, vmax_w), reset_btn,
         title="Options", collapsed=True, width=220, margin=(5, 0, 5, 0),
     )
-    controls = pn.Row(choice, options_card, align="center")
+    controls = pn.Row(choice, options_card, align="center", sizing_mode="stretch_width")
 
     def refresh(catalog: list[gp.ProductVariable]):
         """Repopulate the instrument/variable options from a freshly
@@ -812,7 +828,7 @@ def _no_data_moment(state: AppState, title: str = "no data", index: int | None =
     """
     t0, t1 = state.display_time_bounds
     height_arr = state.spectra.height if state.spectra is not None else np.array([0.0, 1.0])
-    opts = dict(colorbar=True, responsive=True, height=260, title=title, apply_ranges=False,
+    opts = dict(colorbar=True, responsive=True, title=title, apply_ranges=False,
                 tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"])
     if index is not None:
         opts["colorbar_opts"] = _panel_colorbar_models(state, index)
@@ -858,7 +874,7 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
     title = f"{pv.label} ({pv.units})" if pv.units else pv.label
     opts = dict(colorbar=True, colorbar_opts=_panel_colorbar_models(state, index),
                 tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
-                responsive=True, height=260, title=title, apply_ranges=False,
+                responsive=True, title=title, apply_ranges=False,
                 xlabel="time (UTC)", ylabel="" if is_timeseries else "height (m)")
     # colorbar PRESENCE is always True -- even for the invisible timeseries
     # placeholder, which _make_colorbar_hook hides via .visible instead --
@@ -1009,7 +1025,7 @@ def _no_data_range_spectrogram():
     img = hv.Image((np.array([-1.0, 1.0]), np.array([0.0, 1.0]), np.full((2, 2), np.nan)),
                     kdims=["velocity", "height"], vdims=["power"]).opts(
         cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
-        apply_ranges=False, responsive=True, height=280, title="Range spectrogram (no data)",
+        apply_ranges=False, responsive=True, title="Range spectrogram (no data)",
         xlabel="Doppler velocity (m/s)", ylabel="height (m)")
     return hv.Overlay([img])
 
@@ -1041,7 +1057,7 @@ def _range_spectrogram(state: AppState, channel: str):
     images = [
         hv.Image((vel, s.height[rng_slice], block), kdims=["velocity", "height"], vdims=["power"]).opts(
             cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
-            apply_ranges=False, responsive=True, height=280, title=title,
+            apply_ranges=False, responsive=True, title=title,
             xlabel="Doppler velocity (m/s)", ylabel="height (m)")
         for rng_slice, vel, block in segments
     ]
@@ -1054,7 +1070,7 @@ def _no_data_time_spectrogram(state: AppState):
     t0, t1 = state.display_time_bounds
     return hv.Image(((t0, t1), np.array([-1.0, 1.0]), np.full((2, 2), np.nan)),
                      kdims=["time", "velocity"], vdims=["power"]).opts(
-        cmap="viridis", colorbar=True, responsive=True, height=280,
+        cmap="viridis", colorbar=True, responsive=True,
         tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
         title="Time spectrogram (no data)", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)")
@@ -1076,7 +1092,7 @@ def _time_spectrogram(state: AppState, channel: str):
     times = np.array([np.datetime64(int(x), "s") for x in s.time])
     return hv.Image((times, vel, block.T), kdims=["time", "velocity"], vdims=["power"]).opts(
         cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
-        responsive=True, height=280,
+        responsive=True,
         title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)",
     )
@@ -1110,7 +1126,7 @@ def _no_data_spectrum():
     empty_co = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="co-polar").opts(color="steelblue")
     empty_cx = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(color="firebrick")
     return (empty_co * empty_cx).opts(
-        hv.opts.Curve(responsive=True, height=280, tools=["hover"], apply_ranges=False),
+        hv.opts.Curve(responsive=True, tools=["hover"], apply_ranges=False),
         hv.opts.Overlay(title="Spectrum (no data)", legend_position="top_right", apply_ranges=False),
     )
 
@@ -1129,7 +1145,7 @@ def _spectrum_plot(state: AppState):
     curve_co = hv.Curve((vel_co, db_co), kdims=["velocity"], vdims=["power"], label="co-polar").opts(color="steelblue")
     curve_cx = hv.Curve((vel_cx, db_cx), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(color="firebrick")
     return (curve_co * curve_cx).opts(
-        hv.opts.Curve(responsive=True, height=280, tools=["hover"], apply_ranges=False),
+        hv.opts.Curve(responsive=True, tools=["hover"], apply_ranges=False),
         hv.opts.Overlay(title=label, legend_position="top_right", apply_ranges=False,
                          xlabel="Doppler velocity (m/s)", ylabel="power (dB)"),
     )
@@ -1509,18 +1525,34 @@ def build_app() -> pn.template.BaseTemplate:
                             hooks=[_make_range_hook(state, "velocity", "power", auto_y=True)]))
 
     grid = hv.Layout(row1_dmaps + [range_dmap, time_dmap, spectrum_dmap]).cols(3).opts(shared_axes=True)
-    grid_pane = pn.pane.HoloViews(grid, sizing_mode="stretch_width")
+    # stretch_both (not stretch_width): the individual panels are already
+    # responsive=True with no fixed height (see _moment_image et al.), which
+    # makes each one stretch_both on its own -- but the CONTAINING pane also
+    # needs to claim real vertical space for that to have anywhere to go,
+    # rather than collapsing to Bokeh's default height and leaving the rest
+    # of the browser window empty below it.
+    grid_pane = pn.pane.HoloViews(grid, sizing_mode="stretch_both")
 
     top_bar = pn.Row(site_select, day_input, hour_select, prev_btn, next_btn, load_btn,
                       cache_day_btn, reset_all_btn, clean_cache_btn, align="end")
-    controls_row = pn.Row(*[mc[0] for mc in moment_controls], align="end")
+    # stretch_width + each child ALSO stretch_width (see build_moment_controls)
+    # so the 3 dropdown groups split the row's width equally, matching the 3
+    # equal-width columns of the grid panels below -- not just on narrow
+    # screens where they happen to end up similarly sized by coincidence.
+    controls_row = pn.Row(*[mc[0] for mc in moment_controls], align="end", sizing_mode="stretch_width")
 
+    # stretch_both on the outer Column: top_bar/controls_row/the bottom
+    # status row keep their own natural (fixed) height since they never set
+    # a stretch_height/stretch_both sizing_mode, but grid_pane's is
+    # stretch_both, so it's the one that expands to consume whatever
+    # vertical space those fixed-height rows don't need -- filling the
+    # window instead of leaving empty space below a fixed-height grid.
     return pn.Column(
         top_bar,
         controls_row,
         grid_pane,
         pn.Row(instrument_select, channel_toggle, status, download_status, align="center"),
-        sizing_mode="stretch_width",
+        sizing_mode="stretch_both",
     )
 
 
