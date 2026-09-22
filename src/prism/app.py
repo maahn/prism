@@ -8,6 +8,7 @@ Run with:  panel serve src/prism/app.py --show
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 from pathlib import Path
 
@@ -188,22 +189,54 @@ class AppState(param.Parameterized):
         failed) counts -- a single hour's flaky/dropped download shouldn't
         abort caching the rest of the day, the same way discover() already
         tolerates one bad product file, especially since this loop is
-        exactly the "bad connection" scenario most likely to hit one."""
+        exactly the "bad connection" scenario most likely to hit one.
+
+        Downloading hour i+1 starts in a background thread as soon as hour
+        i's download finishes, so it runs WHILE hour i is being decoded
+        (CPU-bound: reading + dB-quantizing every Doppler bin) instead of
+        strictly after -- download is I/O-bound and barely touches the CPU
+        the decode step needs, so by the time one hour's decode is done,
+        the next one's file is often already sitting on disk ready to go,
+        rather than only starting to download at that point.
+        """
         decoder = self._decoder_for_instrument()
+        pending = [r for r in self.available_hours
+                   if not (decoder._zarr_cache_path(cc.cache_path_for(r, self.cache_dir), self.cache_dir)
+                           / "_SUCCESS").exists()]
+        if not pending:
+            return 0, 0
+
         newly_decoded = 0
         failed = 0
-        for i, remote in enumerate(self.available_hours):
-            if on_status:
-                on_status(f"Caching spectra: hour {i + 1}/{len(self.available_hours)} "
-                           f"({remote.filename})...")
-            local = cc.cache_path_for(remote, self.cache_dir)
-            if (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists():
-                continue
-            try:
-                self._ensure_hour_decoded(remote, on_progress=on_progress, on_status=on_status)
-                newly_decoded += 1
-            except Exception:
-                failed += 1
+
+        def _download(remote):
+            return cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
+
+        with ThreadPoolExecutor(max_workers=1) as io_pool:
+            next_future = io_pool.submit(_download, pending[0])
+            for i, remote in enumerate(pending):
+                if on_status:
+                    on_status(f"Caching spectra: hour {i + 1}/{len(pending)} ({remote.filename})...")
+                try:
+                    local = next_future.result()
+                except Exception:
+                    failed += 1
+                    local = None
+                # Kick off the NEXT hour's download now, before this hour's
+                # (CPU-bound) decode -- that's the actual overlap.
+                if i + 1 < len(pending):
+                    next_future = io_pool.submit(_download, pending[i + 1])
+                if local is None:
+                    continue
+                try:
+                    if on_status:
+                        on_status(f"Processing spectra ({self.instrument}), hour {i + 1}/{len(pending)}...")
+                    decoder.ensure_decoded(local, self.cache_dir)
+                    if local.exists():
+                        local.unlink()
+                    newly_decoded += 1
+                except Exception:
+                    failed += 1
         return newly_decoded, failed
 
     def cache_all_products(self, on_progress=None, on_status=None) -> int:
