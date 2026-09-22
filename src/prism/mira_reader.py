@@ -34,12 +34,17 @@ import zarr
 from prism import rpg_reader as rr
 from prism.rpg_reader import MASK_CODE, _encode_db
 
-# Decoding one hour materializes ~5 GB (uncompressed) per channel at MIRA-10's
-# 4096 Doppler bins; process in time chunks so peak memory stays under ~1 GB
-# instead of loading the whole hour into memory at once.
+# Reading the raw file is CHUNKED (rather than one bulk read like rpgpy's
+# for RPG) because MIRA's .znc is HDF5 with the SPCco/SPCcx variables
+# gzip-compressed internally (confirmed via h5py: chunks=(1, 175, 2048),
+# compression="gzip") -- there's no equivalent "read everything in one
+# native call" path the way rpgpy.read_rpg() has for RPG's raw, uncompressed
+# LV0 binary; every read has to decompress whichever HDF5 chunks it
+# touches. Process in time chunks so a single worker's peak memory (the
+# float32 chunk it reads, before quantizing to uint8) stays modest.
 _TIME_CHUNK = 50
-# Measured on a real Munich mira-10 hour: reading one 50-profile chunk from
-# the netCDF file takes ~0.7s, but _encode_db-ing it takes ~3s PER channel
+# Measured on a real Munich mira-10 hour: reading+decompressing one
+# 50-profile chunk takes ~0.7s, but _encode_db-ing it takes ~3s PER channel
 # (~6s for co+cross together) -- that dominant cost is pure numpy math on
 # data already in memory, which should parallelize beautifully, but this
 # process reads the SAME shared netCDF/HDF5 file per chunk, and h5netcdf's
@@ -51,12 +56,6 @@ _TIME_CHUNK = 50
 # _encode_db_parallel, which threads because RPG's data is already fully
 # resident in memory with no per-chunk file access to contend over.
 _MAX_DECODE_WORKERS = min(os.cpu_count() or 4, 8)
-# co_byRange/cross_byRange are chunked (n_time, 1, n_doppler) -- one zarr
-# chunk PER RANGE GATE, spanning the full time axis -- so they need to be
-# populated in RANGE-aligned blocks, not time-aligned ones (see
-# _decode_one_range_block). This many range gates per block, matching
-# _TIME_CHUNK's rough memory budget per worker.
-_RANGE_CHUNK = 10
 
 
 def decide_db_window(sample_linear: np.ndarray) -> tuple[float, float]:
@@ -114,33 +113,6 @@ def _decode_one_chunk(znc_path: str, start: int, stop: int, order: np.ndarray,
     return start, stop, co_db, cross_db
 
 
-def _decode_one_range_block(znc_path: str, r0: int, r1: int, order: np.ndarray,
-                             db_offset: float, db_scale: float, has_cross: bool):
-    """Same idea as _decode_one_chunk, but slices along the RANGE axis
-    instead of time -- used to populate co_byRange/cross_byRange. Its zarr
-    chunking is (n_time, 1, n_doppler): ONE chunk per range gate, spanning
-    the full time axis. Populating it from TIME-sliced chunks (like
-    co_byTime) would mean every single time-chunk write touches EVERY
-    range gate's chunk file, and a partial write to a zarr chunk means
-    reading the whole existing chunk, patching in the new slice, and
-    writing the whole thing back -- that read-modify-write, repeated once
-    per time-chunk times every range chunk, measured as the actual
-    dominant cost (~10 minutes for one hour), dwarfing the encode step by
-    an order of magnitude even after parallelizing that. Slicing along
-    range instead means each write lands on complete, non-overlapping
-    chunks, so no read-modify-write is needed at all.
-    """
-    with xr.open_dataset(znc_path, decode_times=False) as ds:
-        co_db = _encode_db(ds["SPCco"].isel(range=slice(r0, r1)).values[:, :, order],
-                            db_offset, db_scale)
-        if has_cross:
-            cross_db = _encode_db(ds["SPCcx"].isel(range=slice(r0, r1)).values[:, :, order],
-                                   db_offset, db_scale)
-        else:
-            cross_db = np.full_like(co_db, MASK_CODE)
-    return r0, r1, co_db, cross_db
-
-
 def _zarr_cache_path(znc_gz_path: Path, cache_dir: Path) -> Path:
     name = znc_gz_path.name
     for suffix in (".gz", ".znc"):
@@ -192,14 +164,28 @@ def ensure_decoded(znc_gz_path: Path, cache_dir: Path) -> Path:
                     f"{name}_byRange", shape=(n_time, n_range, n_doppler),
                     dtype="uint8", chunks=(n_time, 1, n_doppler))
 
-            # Two SEPARATE passes -- one time-aligned (for *_byTime), one
-            # range-aligned (for *_byRange) -- because those two arrays'
-            # zarr chunkings are transposed relative to each other,
-            # and only a write aligned with an array's OWN chunking avoids
-            # an expensive read-modify-write (see _decode_one_range_block).
-            # Both passes re-read the source file (once per axis) rather
-            # than sharing one pass's results -- more total I/O, but far
-            # less than the read-modify-write cost it replaces.
+            # ONE pass over the source file, time-chunked and parallelized
+            # across processes (see _decode_one_chunk). co_byRange/
+            # cross_byRange used to be populated by a SECOND pass, sliced
+            # along range instead of time to match that array's own zarr
+            # chunking (n_time, 1, n_doppler) and avoid a read-modify-write
+            # -- correct, but it meant reading and decompressing the
+            # source file twice in full, and decompression is most of
+            # what makes MIRA's decode slow to begin with (see
+            # rpg_reader.py's module docstring / _TIME_CHUNK's comment
+            # above for why: gzip-compressed HDF5, unlike RPG's raw
+            # binary). Since the DECODED (uint8) data is 4x smaller than
+            # what was just read (uint8 vs the source's float32), this
+            # keeps the full decoded arrays in memory instead -- typically
+            # a couple GB for one hour -- and populates co_byRange/
+            # cross_byRange from THAT afterwards with plain numpy slicing,
+            # no second read at all. That's exactly how rpg_reader.py
+            # already populates both layouts from one in-memory result;
+            # MIRA just needs the chunked read first to build that result,
+            # since it has no equivalent of rpgpy's one-shot whole-file
+            # read.
+            co_full = np.empty((n_time, n_range, n_doppler), dtype="uint8")
+            cross_full = np.empty((n_time, n_range, n_doppler), dtype="uint8")
             time_bounds = [(s, min(s + _TIME_CHUNK, n_time)) for s in range(0, n_time, _TIME_CHUNK)]
             with ProcessPoolExecutor(max_workers=min(_MAX_DECODE_WORKERS, len(time_bounds))) as pool:
                 futures = [pool.submit(_decode_one_chunk, tmp.name, start, stop, order,
@@ -209,16 +195,17 @@ def ensure_decoded(znc_gz_path: Path, cache_dir: Path) -> Path:
                     start, stop, co_db, cross_db = future.result()
                     arrays["co_byTime"][start:stop] = co_db
                     arrays["cross_byTime"][start:stop] = cross_db
+                    co_full[start:stop] = co_db
+                    cross_full[start:stop] = cross_db
 
-            range_bounds = [(r, min(r + _RANGE_CHUNK, n_range)) for r in range(0, n_range, _RANGE_CHUNK)]
-            with ProcessPoolExecutor(max_workers=min(_MAX_DECODE_WORKERS, len(range_bounds))) as pool:
-                futures = [pool.submit(_decode_one_range_block, tmp.name, r0, r1, order,
-                                        db_offset, db_scale, has_cross)
-                           for r0, r1 in range_bounds]
-                for future in as_completed(futures):
-                    r0, r1, co_db, cross_db = future.result()
-                    arrays["co_byRange"][:, r0:r1, :] = co_db
-                    arrays["cross_byRange"][:, r0:r1, :] = cross_db
+            # A full-array write still lands on complete, non-overlapping
+            # zarr chunks (each of co_byRange's chunks spans the FULL time
+            # axis for one range gate, and this write covers the full time
+            # axis for every range gate at once), so no read-modify-write
+            # here either.
+            arrays["co_byRange"][:] = co_full
+            arrays["cross_byRange"][:] = cross_full
+            del co_full, cross_full
 
     store.attrs["source_file"] = znc_gz_path.name
     store.attrs["db_offset"] = db_offset
