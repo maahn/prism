@@ -130,23 +130,25 @@ class AppState(param.Parameterized):
     def _remote_for_hour(self, hour: int) -> cc.RemoteFile | None:
         return next((r for r in self.available_hours if int(r.filename.split("_")[1][0:2]) == hour), None)
 
-    def load_hour(self, on_progress=None, on_status=None):
-        """Downloads and decodes exactly ONE hour's raw spectra file -- the
-        one currently selected in hour_index -- never the whole day. The raw
-        file is deleted after a successful decode: only the much smaller
-        processed zarr cache is kept, since ensure_decoded() never needs the
-        raw file again once its _SUCCESS marker exists (checked here too, so
-        a re-selected hour whose raw file was already deleted doesn't get
-        re-downloaded just to satisfy this function's own plumbing).
-        Decoding itself is dispatched by instrument -- rpg_reader for RPG's
-        LV0 binary format, mira_reader for METEK's znc/HDF5 format -- but
-        both write the SAME zarr schema, so SpectraHour and everything
-        downstream of it don't need to know or care which one ran."""
-        remote = self._remote_for_hour(self.hour_index)
-        if remote is None:
-            self.spectra = None
-            return
-        decoder = mr if self.instrument in ("mira-10", "mira-35") else rr
+    def _decoder_for_instrument(self):
+        return mr if self.instrument in ("mira-10", "mira-35") else rr
+
+    def _ensure_hour_decoded(self, remote: cc.RemoteFile, on_progress=None, on_status=None) -> Path:
+        """Downloads and decodes ONE hour's raw spectra file into its zarr
+        cache, if not already there, and returns that cache path -- shared
+        by load_hour() (the currently-selected hour) and
+        cache_all_hours() (every other hour for this instrument/day). The
+        raw file is deleted after a successful decode: only the much
+        smaller processed zarr cache is kept, since ensure_decoded() never
+        needs the raw file again once its _SUCCESS marker exists (checked
+        here too, so a re-requested hour whose raw file was already
+        deleted doesn't get re-downloaded just to satisfy this function's
+        own plumbing). Decoding itself is dispatched by instrument --
+        rpg_reader for RPG's LV0 binary format, mira_reader for METEK's
+        znc/HDF5 format -- but both write the SAME zarr schema, so
+        SpectraHour and everything downstream of it don't need to know or
+        care which one ran."""
+        decoder = self._decoder_for_instrument()
         local = cc.cache_path_for(remote, self.cache_dir)
         already_decoded = (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists()
         if not already_decoded:
@@ -158,12 +160,64 @@ class AppState(param.Parameterized):
         zpath = decoder.ensure_decoded(local, self.cache_dir)
         if local.exists():
             local.unlink()
+        return zpath
+
+    def load_hour(self, on_progress=None, on_status=None):
+        """Downloads and decodes exactly ONE hour's raw spectra file -- the
+        one currently selected in hour_index -- never the whole day (see
+        cache_all_hours() for that)."""
+        remote = self._remote_for_hour(self.hour_index)
+        if remote is None:
+            self.spectra = None
+            return
+        zpath = self._ensure_hour_decoded(remote, on_progress=on_progress, on_status=on_status)
         self.spectra = rr.SpectraHour(zpath)
         mid = self.spectra.n_time // 2
         self.selected_time = float(self.spectra.time[mid])
         self.selected_height = float(self.spectra.height[
             self.spectra.nearest_range_index(float(np.median(self.spectra.height)))
         ])
+
+    def cache_all_hours(self, on_progress=None, on_status=None) -> tuple[int, int]:
+        """Downloads and decodes EVERY available hour's raw spectra for the
+        current site/day/instrument, not just the selected one -- for the
+        "Cache entire day" button. Never touches self.spectra/selected_time/
+        selected_height, so it doesn't disturb whatever's currently on
+        screen; each hour's zarr cache is simply left on disk for
+        on_hour_change() to pick up instantly later. Returns (decoded,
+        failed) counts -- a single hour's flaky/dropped download shouldn't
+        abort caching the rest of the day, the same way discover() already
+        tolerates one bad product file, especially since this loop is
+        exactly the "bad connection" scenario most likely to hit one."""
+        decoder = self._decoder_for_instrument()
+        newly_decoded = 0
+        failed = 0
+        for i, remote in enumerate(self.available_hours):
+            if on_status:
+                on_status(f"Caching spectra: hour {i + 1}/{len(self.available_hours)} "
+                           f"({remote.filename})...")
+            local = cc.cache_path_for(remote, self.cache_dir)
+            if (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists():
+                continue
+            try:
+                self._ensure_hour_decoded(remote, on_progress=on_progress, on_status=on_status)
+                newly_decoded += 1
+            except Exception:
+                failed += 1
+        return newly_decoded, failed
+
+    def cache_all_products(self, on_progress=None, on_status=None) -> int:
+        """Resolves every still-lazy (stub) product in the catalog -- for
+        the "Cache entire day" button. Returns how many (product,
+        instrument) pairs were actually resolved (vs. already real)."""
+        pending = {(pv.product_id, pv.instrument_id): pv
+                   for pv in self.catalog if pv.file_path is None}
+        for n, pv in enumerate(pending.values()):
+            if on_status:
+                on_status(f"Caching products: {n + 1}/{len(pending)} ({pv.product_id}, "
+                          f"{pv.instrument_id})...")
+            self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir, on_progress=on_progress)
+        return len(pending)
 
     def catalog_variable(self, catalog_id: str) -> gp.ProductVariable | None:
         return next((p for p in self.catalog if p.catalog_id == catalog_id), None)
@@ -1075,6 +1129,7 @@ def build_app() -> pn.template.BaseTemplate:
     prev_btn = pn.widgets.Button(name="< prev hour", width=100, align="end")
     next_btn = pn.widgets.Button(name="next hour >", width=100, align="end")
     load_btn = pn.widgets.Button(name="Load", button_type="primary", width=80, align="end")
+    cache_day_btn = pn.widgets.Button(name="Cache entire day", button_type="success", width=130, align="end")
     reset_all_btn = pn.widgets.Button(name="Reset all settings", button_type="warning", width=140, align="end")
     clean_cache_btn = pn.widgets.Button(name="Clean cache", button_type="danger", width=100, align="end")
     status = pn.pane.Markdown("", sizing_mode="stretch_width")
@@ -1146,7 +1201,8 @@ def build_app() -> pn.template.BaseTemplate:
         download_status.object = f"Cache: {cc.format_bytes(size)} at `{state.cache_dir}`"
 
     def set_controls_disabled(disabled: bool):
-        for w in (load_btn, hour_select, prev_btn, next_btn, site_select, day_input, instrument_select):
+        for w in (load_btn, cache_day_btn, hour_select, prev_btn, next_btn,
+                  site_select, day_input, instrument_select):
             w.disabled = disabled
 
     async def do_load(event=None):
@@ -1230,6 +1286,36 @@ def build_app() -> pn.template.BaseTemplate:
 
     prev_btn.on_click(step_hour(-1))
     next_btn.on_click(step_hour(1))
+
+    async def do_cache_day(event=None):
+        """Pre-fetches everything for the currently loaded site/day/
+        instrument: every still-lazy product variable AND every available
+        hour's raw spectra, not just what's on screen right now -- so a
+        later click on any variable or hour picker is instant, no
+        surprise download. Deliberately does NOT re-run discover()/re-read
+        the dropdowns first: it caches exactly what's already loaded, the
+        same combination Load last resolved."""
+        set_controls_disabled(True)
+        status.object = "Caching entire day..."
+        loop = asyncio.get_running_loop()
+        n_products = await loop.run_in_executor(
+            None, lambda: state.cache_all_products(on_progress=on_progress, on_status=on_status))
+        n_hours, n_failed = await loop.run_in_executor(
+            None, lambda: state.cache_all_hours(on_progress=on_progress, on_status=on_status))
+
+        def _finish_cache_day():
+            refresh_variable_options()
+            msg = f"Cached {n_products} product(s) and {n_hours} spectra hour(s) for {state.day.isoformat()}."
+            if n_failed:
+                msg += f" ({n_failed} hour(s) failed -- try again if your connection was interrupted.)"
+            status.object = msg
+            show_cache_size()
+            set_controls_disabled(False)
+
+        _push(_finish_cache_day)
+
+    cache_day_btn.on_click(do_cache_day)
+
     def do_reset_all(event):
         settings.reset_all()
         # Location.reload is a Boolean param, not a method -- setting it
@@ -1393,7 +1479,7 @@ def build_app() -> pn.template.BaseTemplate:
     grid_pane = pn.pane.HoloViews(grid, sizing_mode="stretch_width")
 
     top_bar = pn.Row(site_select, day_input, hour_select, prev_btn, next_btn, load_btn,
-                      reset_all_btn, clean_cache_btn, align="end")
+                      cache_day_btn, reset_all_btn, clean_cache_btn, align="end")
     controls_row = pn.Row(*[mc[0] for mc in moment_controls], align="end")
 
     return pn.Column(
