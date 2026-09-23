@@ -17,7 +17,19 @@ netCDF/HDF5 libraries available at install time -- on a machine with conda
 this is usually already the case; otherwise install those via your system
 package manager or conda first.
 
-Install directly from GitHub:
+With conda, install the dependencies from conda-forge first (this brings
+prebuilt netCDF/HDF5 libraries, so no compiler is needed), then PRISM itself
+with pip:
+
+```bash
+conda create -n prism -c conda-forge python=3.13 requests numpy xarray netcdf4 zarr holoviews panel=1.9.4 bokeh=3.8.2
+conda activate prism
+pip install git+https://github.com/maahn/prism.git
+```
+
+`rpgpy` isn't on conda-forge; pip installs it automatically in the last step.
+
+Without conda, install directly from GitHub:
 
 ```bash
 pip install git+https://github.com/maahn/prism.git
