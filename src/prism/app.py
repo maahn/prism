@@ -1447,8 +1447,11 @@ def build_app() -> pn.template.BaseTemplate:
         # image/curve only react to hour/variable/color changes, the marker
         # reacts only to the click position, so a click re-renders as little
         # as possible. Axis ranges are owned by the hook (see _make_range_hook).
+        # The Tap stream lives on the (tiny) marker, not the image: a stream
+        # re-runs the DynamicMap it's attached to on every event, so on the
+        # image it re-sent this panel's whole curtain to the browser per
+        # click for nothing -- the click only needs to reach on_tap_factory.
         image_dmap = hv.DynamicMap(make_image_callback(), streams=[
-            tap,
             param_stream(choice, "value", f"var{i}"),
             param_stream(auto_w, "value", f"auto{i}"),
             param_stream(vmin_w, "value", f"vmin{i}"),
@@ -1457,7 +1460,7 @@ def build_app() -> pn.template.BaseTemplate:
         ]).opts(hv.opts.Image(hooks=[_make_colorbar_hook(state, i, choice), _make_hover_hook(state, i, choice)]))
         marker_dmap = hv.DynamicMap(
             lambda **_kw: _moment_marker(state),
-            streams=[hv.streams.Params(state, ["selected_time", "selected_height"])],
+            streams=[tap, hv.streams.Params(state, ["selected_time", "selected_height"])],
         )
         # A time-only variable (e.g. MWR's LWP) is drawn by this Curve on its
         # own right-hand y-axis, built by hand rather than via multi_y (see
@@ -1488,33 +1491,37 @@ def build_app() -> pn.template.BaseTemplate:
     # of the whole spectrogram image -- only _range_cb/_time_cb's own streams
     # (selected_time / selected_height respectively, since that picks WHICH
     # profile is shown) do that.
-    range_marker_dmap = hv.DynamicMap(
-        lambda **_kw: _range_height_marker(state),
-        streams=[hv.streams.Params(state, ["selected_height"])],
-    )
-    time_marker_dmap = hv.DynamicMap(
-        lambda **_kw: _time_selected_marker(state),
-        streams=[hv.streams.Params(state, ["selected_time"])],
-    )
-    # Tap streams -- like row1's, added purely to route a click through to
-    # state via on_tap_range/on_tap_time; they don't affect what's drawn
-    # (the callback ignores its own x/y and just re-reads current state),
-    # so a click here re-renders the same content, then range_marker_dmap/
-    # time_marker_dmap and the OTHER panels react to the resulting state
-    # change.
+    # Tap streams route a click through to state via on_tap_range/
+    # on_tap_time. They sit on the tiny marker-line DynamicMaps, NOT the
+    # spectrogram images: a stream re-runs the DynamicMap it's attached to
+    # on every event, and on the image that meant re-sending the whole
+    # spectrogram per click -- for a MIRA hour the time spectrogram alone is
+    # ~900 x 4096 float32 (~15 MB), on top of the range spectrogram the new
+    # selection legitimately needs, so clicking the time spectrogram looked
+    # like it did nothing while ~20 MB crawled to the browser. Now a click
+    # only re-renders its marker; the image re-renders only when the OTHER
+    # spectrogram's click actually changes what it shows.
     tap_range = hv.streams.Tap(x=None, y=None)
     tap_range.add_subscriber(on_tap_range)
     tap_time = hv.streams.Tap(x=None, y=None)
     tap_time.add_subscriber(on_tap_time)
+    range_marker_dmap = hv.DynamicMap(
+        lambda **_kw: _range_height_marker(state),
+        streams=[tap_range, hv.streams.Params(state, ["selected_height"])],
+    )
+    time_marker_dmap = hv.DynamicMap(
+        lambda **_kw: _time_selected_marker(state),
+        streams=[tap_time, hv.streams.Params(state, ["selected_time"])],
+    )
     range_dmap = (hv.DynamicMap(
         _range_cb,
-        streams=[tap_range, param_stream(channel_toggle, "value", "ch_range"),
+        streams=[param_stream(channel_toggle, "value", "ch_range"),
                  hv.streams.Params(state, ["hour_index", "selected_time", "range_generation"])],
     ) * range_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "height")]))
     time_dmap = (hv.DynamicMap(
         _time_cb,
-        streams=[tap_time, param_stream(channel_toggle, "value", "ch_time"),
+        streams=[param_stream(channel_toggle, "value", "ch_time"),
                  hv.streams.Params(state, ["hour_index", "selected_height", "range_generation"])],
     ) * time_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                           hooks=[_make_range_hook(state, "time", "velocity", auto_y=True)]))
