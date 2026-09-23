@@ -69,9 +69,9 @@ def unix_seconds(t: np.datetime64) -> float:
 
 class AppState(param.Parameterized):
     site = param.String(default="hyytiala")
-    day = param.Date(default=dt.date(2026, 2, 11))
+    day = param.Date(default=dt.date(2024, 2, 16))
     instrument = param.Selector(default="rpg-fmcw-94", objects=cc.RAW_SPECTRA_INSTRUMENTS)
-    hour_index = param.Integer(default=8)  # UTC hour of day, 0-23
+    hour_index = param.Integer(default=13)  # UTC hour of day, 0-23
     selected_time = param.Number(default=None, allow_None=True)  # unix seconds
     selected_height = param.Number(default=None, allow_None=True)  # meters
     channel = param.Selector(default="co", objects=["co", "cross"])

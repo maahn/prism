@@ -17,9 +17,17 @@ netCDF/HDF5 libraries available at install time -- on a machine with conda
 this is usually already the case; otherwise install those via your system
 package manager or conda first.
 
+Install directly from GitHub:
+
 ```bash
-git clone <this-repo-url>
-cd cloudnetSpecViewer
+pip install git+https://github.com/maahn/prism.git
+```
+
+or from a local clone:
+
+```bash
+git clone https://github.com/maahn/prism.git
+cd prism
 pip install .
 ```
 

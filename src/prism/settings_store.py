@@ -27,7 +27,7 @@ DEFAULTS: dict[str, Any] = {
     "spectra_channel": "co",  # "co" or "cross"
     "time_spectrogram_window_s": 600,
     "cache_dir": None,  # None -> cloudnet_client.DEFAULT_CACHE_DIR
-    "last_session": {"site": "hyytiala", "day": "2026-02-11", "hour": 8, "instrument": "rpg-fmcw-94"},
+    "last_session": {"site": "hyytiala", "day": "2024-02-16", "hour": 13, "instrument": "rpg-fmcw-94"},
 }
 
 
