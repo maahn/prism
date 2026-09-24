@@ -25,7 +25,7 @@ DEFAULT_PANEL_STATE = {
 DEFAULTS: dict[str, Any] = {
     "moment_panels": [dict(DEFAULT_PANEL_STATE) for _ in range(3)],
     "spectra_channel": "co",  # "co" or "cross"
-    "range_spectrogram_content": "power",  # "power" or "ldr"
+    "spectrogram_content": "power",  # "power" or "ldr" -- range AND time spectrograms
     "time_spectrogram_window_s": 600,
     "cache_dir": None,  # None -> cloudnet_client.DEFAULT_CACHE_DIR
     "last_session": {"site": "hyytiala", "day": "2024-02-16", "hour": 13, "instrument": "rpg-fmcw-94"},

@@ -1019,18 +1019,23 @@ def build_spectra_controls(state: AppState):
 
     channel_toggle.param.watch(on_channel, "value")
 
-    # Independent of channel_toggle above: LDR always derives from BOTH
-    # channels (cross - co), so it has no "co"/"cross" reading of its own --
-    # same convention as the single spectrum panel's LDR curve.
-    range_content_toggle = pn.widgets.RadioButtonGroup(
-        name="Range spectrogram", options={"power": "power", "LDR": "ldr"},
-        value=state.settings.get("range_spectrogram_content"))
+    # Shared between the range AND time spectrograms, same as channel_toggle
+    # above. LDR always derives from BOTH channels (cross - co), so it has
+    # no "co"/"cross" reading of its own -- same convention as the single
+    # spectrum panel's LDR curve -- which is also why channel_toggle is
+    # disabled while this is on "ldr": it would otherwise look like a live
+    # control that silently does nothing.
+    content_toggle = pn.widgets.RadioButtonGroup(
+        name="Content (spectrograms)", options={"power": "power", "LDR": "ldr"},
+        value=state.settings.get("spectrogram_content"))
+    channel_toggle.disabled = content_toggle.value == "ldr"
 
-    def on_range_content(event):
-        state.settings.set("range_spectrogram_content", event.new)
+    def on_content(event):
+        state.settings.set("spectrogram_content", event.new)
+        channel_toggle.disabled = event.new == "ldr"
 
-    range_content_toggle.param.watch(on_range_content, "value")
-    return channel_toggle, range_content_toggle
+    content_toggle.param.watch(on_content, "value")
+    return channel_toggle, content_toggle
 
 
 def _no_data_range_spectrogram():
@@ -1104,24 +1109,36 @@ def _no_data_time_spectrogram(state: AppState):
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)")
 
 
-def _time_spectrogram(state: AppState, channel: str):
+def _time_spectrogram(state: AppState, channel: str, content: str):
     """Shows the full loaded hour (not a narrow window around the selection)
     so its "time" axis has the same natural extent as the moments panels and
     can be genuinely axis-linked with them, rather than fighting over a
     shared range at two different intended zoom levels. "tap" must be in
     `tools` for clicking here to select a time at all -- without it Bokeh
-    never attaches a TapTool to this figure."""
+    never attaches a TapTool to this figure.
+
+    content="ldr" swaps in cross_db - co_db (both channels always,
+    independent of `channel`) -- same convention as _range_spectrogram,
+    including keeping it under the same "power" vdim name rather than
+    renaming it (see that function's docstring for why)."""
     s = state.spectra
     if s is None or state.selected_height is None:
         return _no_data_time_spectrogram(state)
     r_idx = s.nearest_range_index(state.selected_height)
-    block = s.time_series(r_idx, 0, s.n_time, channel)
+    if content == "ldr":
+        co_block = s.time_series(r_idx, 0, s.n_time, "co")
+        cx_block = s.time_series(r_idx, 0, s.n_time, "cross")
+        block = cx_block - co_block
+        title = f"Time spectrogram at {s.height[r_idx]:.0f} m (LDR)"
+    else:
+        block = s.time_series(r_idx, 0, s.n_time, channel)
+        title = f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})"
     vel = s.chirp.velocity_axis(r_idx)
     times = np.array([np.datetime64(int(x), "s") for x in s.time])
     return hv.Image((times, vel, block.T), kdims=["time", "velocity"], vdims=["power"]).opts(
         cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
         responsive=True,
-        title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})", apply_ranges=False,
+        title=title, apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)",
     )
 
@@ -1472,7 +1489,7 @@ def build_app() -> pn.template.BaseTemplate:
     pn.state.onload(do_load)  # auto-load the last-used session; fast if cached
 
     moment_controls = [build_moment_controls(state, i) for i in range(N_MOMENT_PANELS)]
-    channel_toggle, range_content_toggle = build_spectra_controls(state)
+    channel_toggle, content_toggle = build_spectra_controls(state)
 
     def refresh_variable_options():
         """Widget options are built once from an empty catalog (before the
@@ -1559,10 +1576,10 @@ def build_app() -> pn.template.BaseTemplate:
                             hooks=[_make_range_hook(state, "time", "height")])))
 
     def _range_cb(**_kw):
-        return _range_spectrogram(state, channel_toggle.value, range_content_toggle.value)
+        return _range_spectrogram(state, channel_toggle.value, content_toggle.value)
 
     def _time_cb(**_kw):
-        return _time_spectrogram(state, channel_toggle.value)
+        return _time_spectrogram(state, channel_toggle.value, content_toggle.value)
 
     def _spectrum_cb(**_kw):
         return _spectrum_plot(state)
@@ -1600,13 +1617,14 @@ def build_app() -> pn.template.BaseTemplate:
     range_dmap = (hv.DynamicMap(
         _range_cb,
         streams=[param_stream(channel_toggle, "value", "ch_range"),
-                 param_stream(range_content_toggle, "value", "content_range"),
+                 param_stream(content_toggle, "value", "content_range"),
                  hv.streams.Params(state, ["hour_index", "selected_time", "range_generation"])],
     ) * range_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "height")]))
     time_dmap = (hv.DynamicMap(
         _time_cb,
         streams=[param_stream(channel_toggle, "value", "ch_time"),
+                 param_stream(content_toggle, "value", "content_time"),
                  hv.streams.Params(state, ["hour_index", "selected_height", "range_generation"])],
     ) * time_marker_dmap).opts(hv.opts.Overlay(apply_ranges=False,
                           hooks=[_make_range_hook(state, "time", "velocity", auto_y=True)]))
@@ -1643,7 +1661,7 @@ def build_app() -> pn.template.BaseTemplate:
         top_bar,
         controls_row,
         grid_pane,
-        pn.Row(instrument_select, channel_toggle, range_content_toggle, status, download_status, align="center"),
+        pn.Row(instrument_select, channel_toggle, content_toggle, status, download_status, align="center"),
         sizing_mode="stretch_both",
     )
 
