@@ -1035,7 +1035,19 @@ def build_spectra_controls(state: AppState):
         channel_toggle.disabled = event.new == "ldr"
 
     content_toggle.param.watch(on_content, "value")
-    return channel_toggle, content_toggle
+
+    # Which of the 3 spectrum-panel curves are drawn -- independent of the
+    # two toggles above, which only affect the range/time spectrograms.
+    spectrum_curves = pn.widgets.CheckBoxGroup(
+        name="Spectrum shows", inline=True,
+        options={"co-polar": "co", "cross-polar": "cross", "LDR": "ldr"},
+        value=state.settings.get("spectrum_curves"))
+
+    def on_spectrum_curves(event):
+        state.settings.set("spectrum_curves", event.new)
+
+    spectrum_curves.param.watch(on_spectrum_curves, "value")
+    return channel_toggle, content_toggle, spectrum_curves
 
 
 def _no_data_range_spectrogram():
@@ -1210,41 +1222,54 @@ def _spectrum_ldr_axis_hook(plot, element):
     rng.start, rng.end = lo - pad, hi + pad
 
 
-def _no_data_spectrum():
-    empty_co = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="co-polar").opts(color="steelblue")
-    empty_cx = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(color="firebrick")
+def _no_data_spectrum(visible: list[str]):
+    empty_co = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="co-polar").opts(
+        color="steelblue", visible="co" in visible)
+    empty_cx = hv.Curve(([], []), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(
+        color="firebrick", visible="cross" in visible)
     empty_ldr = hv.Curve(([], []), kdims=["velocity"], vdims=["ldr"], label="LDR").opts(
-        color="seagreen", line_dash="dashed", hooks=[_spectrum_ldr_axis_hook])
+        color="seagreen", line_dash="dashed", visible="ldr" in visible, hooks=[_spectrum_ldr_axis_hook])
     return (empty_co * empty_cx * empty_ldr).opts(
         hv.opts.Curve(responsive=True, tools=["hover"], apply_ranges=False),
         hv.opts.Overlay(title="Spectrum (no data)", legend_position="top_right", apply_ranges=False),
     )
 
 
-def _spectrum_plot(state: AppState):
-    """Always overlays co-polar, cross-polar, and derived LDR spectra (no
-    channel-toggle dependency -- LDR always uses both channels). LDR rides
-    the panel's own secondary y-axis (see _spectrum_ldr_axis_hook) since its
-    dB range has nothing to do with the raw power curves' scale; cross_db -
-    co_db is the spectral LDR because both channels are already dB-encoded
-    on the same velocity axis (see SpectraHour.spectrum). Bins where either
-    channel is masked -- e.g. a MIRA config with no cross channel at all --
-    come out NaN and simply don't draw, same as the raw co/cross curves
-    already handle that case.
+def _spectrum_plot(state: AppState, visible: list[str]):
+    """Always COMPUTES co-polar, cross-polar, and derived LDR spectra (no
+    channel-toggle dependency -- LDR always uses both channels); `visible`
+    (from the spectrum panel's own checkboxes) only controls which of the
+    three are actually DRAWN, via Bokeh's own renderer-level `visible`
+    style option -- confirmed this hides/restores the right legend entry
+    live across DynamicMap frames too, not just on first render. The curve
+    OBJECTS themselves always stay part of the Overlay regardless, rather
+    than being left out when unchecked: that keeps the Overlay's own
+    structure (and therefore the LDR curve's secondary-axis hook, see
+    _spectrum_ldr_axis_hook) identical across every frame.
+
+    LDR rides the panel's own secondary y-axis since its dB range has
+    nothing to do with the raw power curves' scale; cross_db - co_db is the
+    spectral LDR because both channels are already dB-encoded on the same
+    velocity axis (see SpectraHour.spectrum). Bins where either channel is
+    masked -- e.g. a MIRA config with no cross channel at all -- come out
+    NaN and simply don't draw, same as the raw co/cross curves already
+    handle that case.
     """
     s = state.spectra
     if s is None or state.selected_time is None or state.selected_height is None:
-        return _no_data_spectrum()
+        return _no_data_spectrum(visible)
     t_idx = s.nearest_time_index(state.selected_time)
     r_idx = s.nearest_range_index(state.selected_height)
     vel_co, db_co = s.spectrum(t_idx, r_idx, "co")
     vel_cx, db_cx = s.spectrum(t_idx, r_idx, "cross")
     label = (f"Spectrum @ {s.height[r_idx]:.0f} m, "
               f"{dt.datetime.utcfromtimestamp(int(s.time[t_idx])).strftime('%H:%M:%S')} UTC")
-    curve_co = hv.Curve((vel_co, db_co), kdims=["velocity"], vdims=["power"], label="co-polar").opts(color="steelblue")
-    curve_cx = hv.Curve((vel_cx, db_cx), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(color="firebrick")
+    curve_co = hv.Curve((vel_co, db_co), kdims=["velocity"], vdims=["power"], label="co-polar").opts(
+        color="steelblue", visible="co" in visible)
+    curve_cx = hv.Curve((vel_cx, db_cx), kdims=["velocity"], vdims=["power"], label="cross-polar").opts(
+        color="firebrick", visible="cross" in visible)
     curve_ldr = hv.Curve((vel_co, db_cx - db_co), kdims=["velocity"], vdims=["ldr"], label="LDR").opts(
-        color="seagreen", line_dash="dashed", hooks=[_spectrum_ldr_axis_hook])
+        color="seagreen", line_dash="dashed", visible="ldr" in visible, hooks=[_spectrum_ldr_axis_hook])
     return (curve_co * curve_cx * curve_ldr).opts(
         hv.opts.Curve(responsive=True, tools=["hover"], apply_ranges=False),
         hv.opts.Overlay(title=label, legend_position="top_right", apply_ranges=False,
@@ -1489,7 +1514,7 @@ def build_app() -> pn.template.BaseTemplate:
     pn.state.onload(do_load)  # auto-load the last-used session; fast if cached
 
     moment_controls = [build_moment_controls(state, i) for i in range(N_MOMENT_PANELS)]
-    channel_toggle, content_toggle = build_spectra_controls(state)
+    channel_toggle, content_toggle, spectrum_curves = build_spectra_controls(state)
 
     def refresh_variable_options():
         """Widget options are built once from an empty catalog (before the
@@ -1582,7 +1607,7 @@ def build_app() -> pn.template.BaseTemplate:
         return _time_spectrogram(state, channel_toggle.value, content_toggle.value)
 
     def _spectrum_cb(**_kw):
-        return _spectrum_plot(state)
+        return _spectrum_plot(state, spectrum_curves.value)
 
     # auto_y=True where the y axis SHOULD refit on every update: the time
     # spectrogram's velocity axis changes with the selected chirp, and the
@@ -1630,7 +1655,8 @@ def build_app() -> pn.template.BaseTemplate:
                           hooks=[_make_range_hook(state, "time", "velocity", auto_y=True)]))
     spectrum_dmap = hv.DynamicMap(
         _spectrum_cb,
-        streams=[hv.streams.Params(state, ["hour_index", "selected_time", "selected_height", "range_generation"])],
+        streams=[param_stream(spectrum_curves, "value", "spectrum_curves"),
+                 hv.streams.Params(state, ["hour_index", "selected_time", "selected_height", "range_generation"])],
     ).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "power", auto_y=True)]))
 
@@ -1661,7 +1687,8 @@ def build_app() -> pn.template.BaseTemplate:
         top_bar,
         controls_row,
         grid_pane,
-        pn.Row(instrument_select, channel_toggle, content_toggle, status, download_status, align="center"),
+        pn.Row(instrument_select, channel_toggle, content_toggle, spectrum_curves, status, download_status,
+               align="center"),
         sizing_mode="stretch_both",
     )
 
