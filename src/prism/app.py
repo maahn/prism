@@ -345,10 +345,10 @@ def _make_range_hook(state: AppState, x_dim: str | None, y_dim: str | None, auto
 
     auto_y=True opts the y axis out of the generation rule, for axes whose
     NATURAL extent can change between frames without a generation bump: the
-    single spectrum's power axis (different profile, different dB range
-    every click) and the time spectrogram's velocity axis (RPG-FMCW-94's
-    per-chirp Nyquist velocity, which can differ at the newly clicked
-    height).
+    single spectrum's power axis and the LDR spectrum's own axis (different
+    profile, different dB range every click) and the time spectrogram's
+    velocity axis (RPG-FMCW-94's per-chirp Nyquist velocity, which can
+    differ at the newly clicked height).
 
     Even so, auto_y does NOT mean "refit unconditionally on every frame" --
     it refits only when the newly computed bounds actually DIFFER from the
@@ -1151,6 +1151,34 @@ def _spectrum_plot(state: AppState):
     )
 
 
+def _no_data_ldr_spectrum():
+    return hv.Curve(([], []), kdims=["velocity"], vdims=["ldr"]).opts(
+        color="seagreen", responsive=True, tools=["hover"], apply_ranges=False,
+        title="LDR spectrum (no data)", xlabel="Doppler velocity (m/s)", ylabel="LDR (dB)")
+
+
+def _ldr_spectrum_plot(state: AppState):
+    """Spectral linear depolarization ratio: cross/co in dB is just
+    cross_db - co_db per Doppler bin, since both channels are already
+    dB-encoded on the same velocity axis (see SpectraHour.spectrum). Bins
+    where either channel is masked -- e.g. a MIRA config with no cross
+    channel at all -- come out NaN and simply don't draw, same as the raw
+    co/cross curves in _spectrum_plot already do; no extra handling needed.
+    """
+    s = state.spectra
+    if s is None or state.selected_time is None or state.selected_height is None:
+        return _no_data_ldr_spectrum()
+    t_idx = s.nearest_time_index(state.selected_time)
+    r_idx = s.nearest_range_index(state.selected_height)
+    vel, db_co = s.spectrum(t_idx, r_idx, "co")
+    _, db_cx = s.spectrum(t_idx, r_idx, "cross")
+    label = (f"LDR spectrum @ {s.height[r_idx]:.0f} m, "
+              f"{dt.datetime.utcfromtimestamp(int(s.time[t_idx])).strftime('%H:%M:%S')} UTC")
+    return hv.Curve((vel, db_cx - db_co), kdims=["velocity"], vdims=["ldr"]).opts(
+        color="seagreen", responsive=True, tools=["hover"], apply_ranges=False,
+        title=label, xlabel="Doppler velocity (m/s)", ylabel="LDR (dB)")
+
+
 def build_app() -> pn.template.BaseTemplate:
     settings = ss.Settings()
     state = AppState(settings)
@@ -1483,6 +1511,9 @@ def build_app() -> pn.template.BaseTemplate:
     def _spectrum_cb(**_kw):
         return _spectrum_plot(state)
 
+    def _ldr_cb(**_kw):
+        return _ldr_spectrum_plot(state)
+
     # auto_y=True where the y axis SHOULD refit on every update: the time
     # spectrogram's velocity axis changes with the selected chirp, and the
     # spectrum's power axis would otherwise clip later spectra off-scale.
@@ -1530,8 +1561,24 @@ def build_app() -> pn.template.BaseTemplate:
         streams=[hv.streams.Params(state, ["hour_index", "selected_time", "selected_height", "range_generation"])],
     ).opts(hv.opts.Overlay(apply_ranges=False,
                             hooks=[_make_range_hook(state, "velocity", "power", auto_y=True)]))
+    # A bare Curve (not an Overlay like spectrum_dmap above, since there's
+    # only one line here) -- hv.opts.Curve's own hooks work the same way on
+    # a standalone Curve DynamicMap, exactly like row1's curve_dmap already
+    # relies on above.
+    ldr_dmap = hv.DynamicMap(
+        _ldr_cb,
+        streams=[hv.streams.Params(state, ["hour_index", "selected_time", "selected_height", "range_generation"])],
+    ).opts(hv.opts.Curve(apply_ranges=False,
+                          hooks=[_make_range_hook(state, "velocity", "ldr", auto_y=True)]))
 
-    grid = hv.Layout(row1_dmaps + [range_dmap, time_dmap, spectrum_dmap]).cols(3).opts(shared_axes=True)
+    # hv.Empty() pads row 1 out to 4 columns so the flat cols(4) wrap lands
+    # the LDR spectrum beside (not below) the other row-2 panels, while
+    # keeping every panel in ONE hv.Layout -- required for shared_axes=True
+    # to link "height"/"time"/"velocity" ranges across the two rows at all
+    # (see _make_range_hook's docstring). Splitting this into two separate
+    # per-row Layouts would drop that cross-row linking entirely.
+    grid = hv.Layout(row1_dmaps + [hv.Empty()]
+                      + [range_dmap, time_dmap, spectrum_dmap, ldr_dmap]).cols(4).opts(shared_axes=True)
     # stretch_both (not stretch_width): the individual panels are already
     # responsive=True with no fixed height (see _moment_image et al.), which
     # makes each one stretch_both on its own -- but the CONTAINING pane also
@@ -1543,10 +1590,12 @@ def build_app() -> pn.template.BaseTemplate:
     top_bar = pn.Row(site_select, day_input, hour_select, prev_btn, next_btn, load_btn,
                       cache_day_btn, reset_all_btn, clean_cache_btn, align="end")
     # stretch_width + each child ALSO stretch_width (see build_moment_controls)
-    # so the 3 dropdown groups split the row's width equally, matching the 3
-    # equal-width columns of the grid panels below -- not just on narrow
-    # screens where they happen to end up similarly sized by coincidence.
-    controls_row = pn.Row(*[mc[0] for mc in moment_controls], align="end", sizing_mode="stretch_width")
+    # so the 3 dropdown groups, plus a trailing spacer standing in for row
+    # 1's own hv.Empty() cell, split the row's width into 4 equal shares --
+    # matching the grid's 4 columns below, not just on narrow screens where
+    # they happen to end up similarly sized by coincidence.
+    controls_row = pn.Row(*[mc[0] for mc in moment_controls], pn.Spacer(sizing_mode="stretch_width"),
+                           align="end", sizing_mode="stretch_width")
 
     # stretch_both on the outer Column: top_bar/controls_row/the bottom
     # status row keep their own natural (fixed) height since they never set
