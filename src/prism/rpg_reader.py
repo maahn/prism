@@ -141,21 +141,41 @@ def ensure_decoded(lv0_path: Path, cache_dir: Path) -> Path:
 
     header, data = rpgpy.read_rpg(str(lv0_path))
 
-    # RPG-FMCW-94 is a slant-45 STSR (simultaneous transmit/receive) radar:
-    # HSpec is the H-channel power spectrum, and TotSpec is H + V + the
-    # cross term, NOT H + V alone -- so the V-channel ("co", by the same
-    # convention CloudnetPy's own moments use, e.g. Zh) is
-    # TotSpec - HSpec - 2*Re(ReVHSpec), not just TotSpec - HSpec. Missing
-    # that cross-correlation term is a small correction in the well-
-    # detected core of a spectrum (median ~0.1 dB against real data) but
-    # grows to several dB near the noise floor, exactly where a careful
-    # analysis (e.g. spectral LDR/SLDR, per Myagkov/RPG's own published
-    # method) would be most sensitive to it. The channel labeling itself
-    # (HSpec = cross, the derived V-ish quantity = co) was separately
-    # verified against Cloudnet's published `ldr` moment (HSpec / co
-    # matched to within ~0.9 dB MAD) and is unaffected by this correction.
-    co_db = _encode_db_parallel(data["TotSpec"] - data["HSpec"] - 2 * data["ReVHSpec"])
-    cross_db = _encode_db_parallel(data["HSpec"])
+    # Only a dual-pol STSR (simultaneous transmit/receive) radar -- RPG's
+    # own header flags this as DualPol==2 -- exports HSpec and ReVHSpec at
+    # all. For those, TotSpec is H + V + the cross term, NOT H + V alone,
+    # so the V-channel ("co", by the same convention CloudnetPy's own
+    # moments use, e.g. Zh) is TotSpec - HSpec - 2*Re(ReVHSpec), not just
+    # TotSpec - HSpec. Missing that cross-correlation term is a small
+    # correction in the well-detected core of a spectrum (median ~0.1 dB
+    # against real data) but grows to several dB near the noise floor,
+    # exactly where a careful analysis (e.g. spectral LDR/SLDR, per
+    # Myagkov/RPG's own published method) would be most sensitive to it.
+    # The channel labeling itself (HSpec = cross, the derived V-ish
+    # quantity = co) was separately verified against Cloudnet's published
+    # `ldr` moment (HSpec / co matched to within ~0.9 dB MAD) and is
+    # unaffected by this correction.
+    #
+    # A single-polarization radar (DualPol==0 -- confirmed against a real
+    # Jülich file, whose `data` dict has no HSpec/ReVHSpec/HNoisePow keys
+    # at all) has no cross-channel to derive: TotSpec there already IS the
+    # co-channel power on its own, so decoding it through the STSR formula
+    # crashed with a KeyError instead of just... not having an LDR/SLDR
+    # product for that instrument, which is the real, unremarkable
+    # situation. A DualPol==1 (LDR mode, alternating H/V transmission
+    # rather than simultaneous) radar isn't verified against a real file
+    # here, but per RPG's own docs it exports HSpec without ReVHSpec --
+    # there's no complex covariance to subtract in that mode, so TotSpec is
+    # used as co directly, same as the single-pol case, just with a real
+    # HSpec for cross instead of a masked one.
+    has_h = "HSpec" in data
+    has_cross_term = "ReVHSpec" in data
+    if has_h and has_cross_term:
+        co_db = _encode_db_parallel(data["TotSpec"] - data["HSpec"] - 2 * data["ReVHSpec"])
+        cross_db = _encode_db_parallel(data["HSpec"])
+    else:
+        co_db = _encode_db_parallel(data["TotSpec"])
+        cross_db = _encode_db_parallel(data["HSpec"]) if has_h else np.full_like(co_db, MASK_CODE)
     time_unix = data["Time"].astype("int64") + RPG_EPOCH_OFFSET
     del data
 

@@ -138,10 +138,10 @@ class AppState(param.Parameterized):
         self.load_hour(on_progress=on_progress, on_status=on_status)
 
     def hours_with_data(self) -> set[int]:
-        return {int(r.filename.split("_")[1][0:2]) for r in self.available_hours}
+        return {cc.hour_of_filename(r.filename) for r in self.available_hours}
 
     def _remote_for_hour(self, hour: int) -> cc.RemoteFile | None:
-        return next((r for r in self.available_hours if int(r.filename.split("_")[1][0:2]) == hour), None)
+        return next((r for r in self.available_hours if cc.hour_of_filename(r.filename) == hour), None)
 
     def _decoder_for_instrument(self):
         return mr if self.instrument in ("mira-10", "mira-35") else rr

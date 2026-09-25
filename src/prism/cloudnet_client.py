@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -73,6 +74,42 @@ def _is_raw_spectra_file(instrument: str, filename: str) -> bool:
     if instrument == "mira-35":
         return upper.endswith(".ZNC.GZ") and "WINDPPI" not in upper
     return False
+
+
+# Raw spectra filenames embed a YYYYMMDDHHMMSS (or YYMMDD_HHMMSS-style)
+# timestamp, but neither its exact digit width nor whether an underscore
+# separates the date from the time is consistent across sites/instruments:
+#   260211_000000_P09_ZEN.LV0            (Hyytiälä/Bucharest RPG-FMCW-94)
+#   20260916_000004.znc.gz               (Munich MIRA-10)
+#   joyrad94_20240110000001_P01_ZEN.lv0  (Ny-Ålesund RPG, date+time RUN
+#                                          TOGETHER with no separator)
+#   mirac-a_20210120000001_P01_ZEN.lv0   (Jülich RPG, same)
+# A previous version assumed the hour was always the first two characters
+# of the SECOND underscore-separated token (filename.split("_")[1][0:2]),
+# which happened to work for the first two formats above but silently broke
+# for the other two: split("_")[1] there is the full run-together
+# "20240110000001"/"20210120000001", so [0:2] read "20" -- the START OF THE
+# YEAR, not the hour -- meaning every file that day was misfiled under
+# "20 UTC" and the other 23-24 hours looked entirely missing. Matching the
+# embedded timestamp with a regex instead of guessing at token positions
+# handles both layouts, and isn't tied to a particular instrument having a
+# name prefix or not.
+_RUN_TOGETHER_TIMESTAMP = re.compile(r"(?<!\d)(\d{8})(\d{6})(?!\d)")  # YYYYMMDDHHMMSS, no separator
+_SEPARATED_TIMESTAMP = re.compile(r"(?<!\d)(\d{6}|\d{8})_(\d{6})(?!\d)")  # (Y)YMMDD_HHMMSS
+
+
+def hour_of_filename(filename: str) -> int:
+    """Extract the UTC hour a raw spectra filename's embedded timestamp
+    refers to. Raises ValueError if no recognized timestamp pattern is
+    found, rather than silently returning a wrong hour."""
+    for pattern in (_RUN_TOGETHER_TIMESTAMP, _SEPARATED_TIMESTAMP):
+        m = pattern.search(filename)
+        if m:
+            hhmmss = m.group(2)
+            hour = int(hhmmss[0:2])
+            if 0 <= hour <= 23:
+                return hour
+    raise ValueError(f"could not find an embedded HHMMSS timestamp in filename: {filename!r}")
 
 
 def list_available_instruments(site: str, day: date) -> list[str]:
