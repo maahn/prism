@@ -10,6 +10,8 @@ raw spectra and processed products, then shows linked, zoomable time-height
 panels plus range/time spectrograms and a single Doppler spectrum, all
 connected by clicking anywhere on a moments panel.
 
+![PRISM showing Hyytiälä, 2024-02-16 13 UTC](docs/screenshot.png)
+
 ## Install
 
 Requires Python >= 3.10. `rpgpy` and `netCDF4` need a C compiler and the
