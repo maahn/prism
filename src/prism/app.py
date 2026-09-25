@@ -1177,6 +1177,9 @@ def build_app() -> pn.template.BaseTemplate:
         width=150, align="end")
     prev_btn = pn.widgets.Button(name="< prev hour", width=100, align="end")
     next_btn = pn.widgets.Button(name="next hour >", width=100, align="end")
+    play_btn = pn.widgets.Button(name="▶ Play", button_type="success", width=90, align="end")
+    speed_select = pn.widgets.Select(name="", options={"1x": 1, "2x": 2, "5x": 5, "10x": 10},
+                                      value=1, width=70, align="end")
     load_btn = pn.widgets.Button(name="Load", button_type="primary", width=80, align="end")
     cache_day_btn = pn.widgets.Button(name="Cache entire day", button_type="success", width=130, align="end")
     reset_all_btn = pn.widgets.Button(name="Reset all settings", button_type="warning", width=140, align="end")
@@ -1251,10 +1254,46 @@ def build_app() -> pn.template.BaseTemplate:
 
     def set_controls_disabled(disabled: bool):
         for w in (load_btn, cache_day_btn, hour_select, prev_btn, next_btn,
-                  site_select, day_input, instrument_select):
+                  play_btn, speed_select, site_select, day_input, instrument_select):
             w.disabled = disabled
 
+    # Playback state is plain closure state, not an AppState param: nothing
+    # needs to REACT to "is playing", only to selected_time (already a
+    # param), which _advance_playhead updates the exact same way a click
+    # does.
+    _playback = {"cb": None}
+
+    def stop_playback():
+        if _playback["cb"] is not None:
+            _playback["cb"].stop()
+            _playback["cb"] = None
+        play_btn.name = "▶ Play"
+
+    def _advance_playhead():
+        s = state.spectra
+        if s is None or s.n_time == 0:
+            return
+        idx = s.nearest_time_index(state.selected_time) if state.selected_time is not None else 0
+        idx = (idx + speed_select.value) % s.n_time  # loop back at hour end
+        state.selected_time = float(s.time[idx])
+
+    def toggle_playback(event):
+        if _playback["cb"] is not None:
+            stop_playback()
+            return
+        if state.spectra is None:
+            return
+        # Speed changes the stride per tick, not the tick rate: this bounds
+        # how many Bokeh pushes/sec playback can ever generate regardless of
+        # speed, and treats "faster" as "skip more" -- the same mental model
+        # as scrubbing.
+        _playback["cb"] = pn.state.add_periodic_callback(_advance_playhead, period=200)
+        play_btn.name = "⏸ Pause"
+
+    play_btn.on_click(toggle_playback)
+
     async def do_load(event=None):
+        stop_playback()
         set_controls_disabled(True)
         status.object = "Loading..."
         state.site = site_select.value
@@ -1288,6 +1327,7 @@ def build_app() -> pn.template.BaseTemplate:
             settings.set_last_session(state.site, state.day.isoformat(), state.hour_index, state.instrument)
             state.range_generation += 1
             set_controls_disabled(False)
+            play_btn.disabled = state.spectra is None
 
         _push(_finish_load)
 
@@ -1307,6 +1347,7 @@ def build_app() -> pn.template.BaseTemplate:
             # the one now showing in the dropdowns. Require an explicit
             # Load to resync everything together.
             return
+        stop_playback()
         set_controls_disabled(True)
         status.object = "Decoding hour..."
         state.hour_index = event.new
@@ -1323,6 +1364,7 @@ def build_app() -> pn.template.BaseTemplate:
         settings.set_last_session(state.site, state.day.isoformat(), state.hour_index, state.instrument)
         state.range_generation += 1  # refit axes for the newly loaded hour
         set_controls_disabled(False)
+        play_btn.disabled = state.spectra is None
 
     hour_select.param.watch(on_hour_change, "value")
 
@@ -1344,6 +1386,7 @@ def build_app() -> pn.template.BaseTemplate:
         surprise download. Deliberately does NOT re-run discover()/re-read
         the dropdowns first: it caches exactly what's already loaded, the
         same combination Load last resolved."""
+        stop_playback()
         set_controls_disabled(True)
         status.object = "Caching entire day..."
         loop = asyncio.get_running_loop()
@@ -1400,6 +1443,7 @@ def build_app() -> pn.template.BaseTemplate:
         def on_tap(x, y):
             if x is None or y is None:
                 return
+            stop_playback()  # a manual click always takes back control
             state.selected_time = unix_seconds(to_datetime64(x))
             state.selected_height = float(y)
         return on_tap
@@ -1410,6 +1454,7 @@ def build_app() -> pn.template.BaseTemplate:
         # tap which reports both.
         if y is None:
             return
+        stop_playback()
         state.selected_height = float(y)
 
     def on_tap_time(x, y):
@@ -1417,6 +1462,7 @@ def build_app() -> pn.template.BaseTemplate:
         # height -- symmetric to on_tap_range above.
         if x is None:
             return
+        stop_playback()
         state.selected_time = unix_seconds(to_datetime64(x))
 
     def param_stream(obj, name, unique_key):
@@ -1540,8 +1586,8 @@ def build_app() -> pn.template.BaseTemplate:
     # of the browser window empty below it.
     grid_pane = pn.pane.HoloViews(grid, sizing_mode="stretch_both")
 
-    top_bar = pn.Row(site_select, day_input, hour_select, prev_btn, next_btn, load_btn,
-                      cache_day_btn, reset_all_btn, clean_cache_btn, align="end")
+    top_bar = pn.Row(site_select, day_input, hour_select, prev_btn, next_btn, play_btn, speed_select,
+                      load_btn, cache_day_btn, reset_all_btn, clean_cache_btn, align="end")
     # stretch_width + each child ALSO stretch_width (see build_moment_controls)
     # so the 3 dropdown groups split the row's width equally, matching the 3
     # equal-width columns of the grid panels below -- not just on narrow
