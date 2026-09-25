@@ -143,3 +143,39 @@ def test_display_time_bounds_falls_back_to_selected_hour_placeholder(settings):
     t0, t1 = state.display_time_bounds
     assert t0 == np.datetime64(dt.date(2024, 1, 10)) + np.timedelta64(13, "h")
     assert t1 - t0 == np.timedelta64(1, "h")
+
+
+def test_load_hour_propagates_decode_failure_without_mutating_spectra(settings, monkeypatch):
+    """A real Ny-Alesund file (2024-01-10, hour 11) has a corrupted embedded
+    timestamp that rpgpy itself rejects with RPGFileError -- confirmed
+    directly against the downloaded file, so it's a genuine upstream data
+    problem, not something we can decode around. Before the app.py fix
+    (do_load/on_hour_change catching only ConnectionError), this exception
+    propagated all the way out of the async callback uncaught: Panel just
+    logged it to the server console, and set_controls_disabled(False) never
+    ran, leaving every control disabled and "Loading..." on screen until the
+    page was reloaded. The fix depends on load_hour() actually letting this
+    exception through (rather than swallowing it) so do_load/on_hour_change's
+    now-broadened `except Exception` can catch it and recover -- this is
+    the contract that regresses if load_hour ever grows a bare try/except
+    of its own."""
+    import rpgpy
+
+    state = AppState(settings)
+    state.available_hours = [_remote("joyrad94_20240110110000_P01_ZEN.lv0")]
+    previous_spectra = object()
+    state.spectra = previous_spectra  # simulate a previously-loaded hour
+
+    def boom(*a, **k):
+        raise rpgpy.RPGFileError(
+            "Timestamp 940908380 is outside the expected range [726577200, 726580798].")
+
+    monkeypatch.setattr(state, "_ensure_hour_decoded", boom)
+    state.hour_index = 11
+
+    with pytest.raises(rpgpy.RPGFileError):
+        state.load_hour()
+
+    # The prior hour's data must still be there for the UI to fall back to
+    # (or at least not be silently cleared) -- not left half-updated.
+    assert state.spectra is previous_spectra

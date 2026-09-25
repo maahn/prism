@@ -11,6 +11,7 @@ periodically to catch a case we haven't seen yet.
 import datetime
 
 import pytest
+import zarr
 
 from prism import cloudnet_client as cc
 from prism import mira_reader as mr
@@ -57,3 +58,39 @@ def test_first_hour_decodes_without_raising(site, day, instrument, tmp_path):
     decoder = rr if instrument == "rpg-fmcw-94" else mr
     out = decoder.ensure_decoded(local, tmp_path / "decoded")
     assert (out / "_SUCCESS").exists()
+
+
+def test_known_corrupted_file_is_recovered_not_lost(tmp_path):
+    """Pins a real, confirmed-corrupted file: Ny-Alesund 2024-01-10 hour 11
+    has a corrupted tail -- the last 64 of 1787 profiles fail rpgpy's own
+    timestamp check (checksum verified against the Cloudnet API, so this is
+    upstream data corruption, not a download bug on our side). rpgpy itself
+    offers no way to decode around it (it exposes no option to skip the
+    check, and dies on the FIRST bad timestamp it hits), so
+    rpg_reader._repair_truncated_tail reverse-engineers rpgpy's own LV0
+    record layout well enough to find exactly where the file desyncs,
+    truncates there, and hands rpgpy a patched copy -- recovering the good
+    1723 profiles instead of losing the whole hour (CloudnetPy's own
+    rpg.py, by contrast, just drops a file like this entirely; see the
+    comment in tests/test_rpg_reader.py's corruption-recovery section for
+    why we chose differently here).
+
+    The exact counts (1723 kept, 1787 total) are pinned to THIS file, not
+    computed -- a future rpgpy behavior change (looser or stricter
+    validation) would change them, and this test failing is exactly the
+    signal that our own truncation math needs re-checking against reality.
+    """
+    files = cc.list_raw_spectra_files("ny-alesund", datetime.date(2024, 1, 10), "rpg-fmcw-94")
+    remote = next((f for f in files if cc.hour_of_filename(f.filename) == 11), None)
+    if remote is None:
+        pytest.skip("expected hour-11 file no longer published for this site/day")
+    local = cc.ensure_downloaded(remote, cache_dir=tmp_path / "raw")
+
+    statuses = []
+    out = rr.ensure_decoded(local, tmp_path / "decoded", on_status=statuses.append)
+
+    assert (out / "_SUCCESS").exists()
+    assert any("corrupted after profile 1723/1787" in s for s in statuses)
+    store = zarr.open_group(str(out), mode="r")
+    assert dict(store.attrs["truncated_from_corruption"]) == {"kept_samples": 1723, "expected_samples": 1787}
+    assert store["co_byTime"].shape[0] == 1723

@@ -41,3 +41,15 @@ pytest -m network
 
 Run it whenever a new site or instrument is added to the app, or
 periodically to catch a site/instrument combination we haven't seen yet.
+
+It also pins a real corrupted file (Ny-Alesund 2024-01-10, hour 11 --
+`test_known_corrupted_file_is_recovered_not_lost`): rpgpy's own timestamp
+check rejects the last 64 of 1787 profiles as garbage. Rather than losing
+the whole hour (which is what CloudnetPy's own reader does for a file like
+this -- see its `rpg.py`), `rpg_reader._repair_truncated_tail` reverse-
+engineers rpgpy's LV0 record layout well enough to truncate exactly at the
+corruption and recover the good prefix. The byte-layout logic itself
+(`_scan_sample_records` / `_find_corruption_boundary`) is unit-tested
+offline in `tests/test_rpg_reader.py` against a hand-built fixture; only
+the full round-trip through the real `rpgpy` C extension needs the actual
+network-fetched file.

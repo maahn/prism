@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import logging
 from pathlib import Path
 
 import holoviews as hv
@@ -50,6 +51,8 @@ hv.config.image_rtol = 0.5
 
 N_MOMENT_PANELS = 3
 DEFAULT_PANEL_VARIABLES = ["categorize:Z", "categorize:v", "categorize:width"]
+
+logger = logging.getLogger(__name__)
 
 
 def to_datetime64(x) -> np.datetime64:
@@ -170,7 +173,7 @@ class AppState(param.Parameterized):
             local = cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
             if on_status:
                 on_status(f"Processing spectra ({self.instrument})...")
-        zpath = decoder.ensure_decoded(local, self.cache_dir)
+        zpath = decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
         if local.exists():
             local.unlink()
         return zpath
@@ -243,7 +246,7 @@ class AppState(param.Parameterized):
                 try:
                     if on_status:
                         on_status(f"Processing spectra ({self.instrument}), hour {i + 1}/{len(pending)}...")
-                    decoder.ensure_decoded(local, self.cache_dir)
+                    decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
                     if local.exists():
                         local.unlink()
                     newly_decoded += 1
@@ -1212,8 +1215,16 @@ def build_app() -> pn.template.BaseTemplate:
         if state.spectra is None:
             return (f"Loaded {len(state.catalog)} curtain variable(s) for the day, but no spectra "
                      f"for hour {state.hour_index:02d} UTC -- pick a different hour above.")
-        return (f"Loaded hour {state.hour_index:02d} UTC ({len(state.available_hours)} hour(s) "
-                 f"available that day), {len(state.catalog)} curtain variable(s).")
+        base = (f"Loaded hour {state.hour_index:02d} UTC ({len(state.available_hours)} hour(s) "
+                f"available that day), {len(state.catalog)} curtain variable(s).")
+        truncated = state.spectra.truncated_from_corruption
+        if truncated:
+            # Persistent (not just the one-off on_status message at decode
+            # time) so this stays visible for as long as this recovered
+            # hour is on screen, not just at the moment it loaded.
+            base += (f" ⚠️ Raw file was corrupted after profile {truncated['kept_samples']}/"
+                     f"{truncated['expected_samples']} -- the rest of this hour is missing.")
+        return base
 
     # Background work (download/decode) runs in a thread via run_in_executor
     # so the event loop stays free to actually flush status-text updates to
@@ -1265,8 +1276,19 @@ def build_app() -> pn.template.BaseTemplate:
         try:
             await loop.run_in_executor(
                 None, lambda: state.refresh_site_day(on_progress=on_progress, on_status=on_status))
-        except ConnectionError as exc:
-            status.object = f"⚠️ {exc}"
+        except Exception as exc:
+            # Broad on purpose: a flaky connection (ConnectionError) and a
+            # corrupted raw file (e.g. rpgpy.RPGFileError on a bad embedded
+            # timestamp -- seen for real on a Ny-Alesund hour) both need the
+            # SAME handling here -- report it and re-enable the controls --
+            # rather than letting either propagate out of this coroutine.
+            # Uncaught, that leaves set_controls_disabled(False) never
+            # called: every control stays disabled and "Loading..." stays
+            # on screen until the page is reloaded, since Panel/Tornado
+            # only logs the exception to the server console, never back to
+            # this session's own status text.
+            logger.exception("Failed to load %s %s hour %d", state.site, state.day, state.hour_index)
+            status.object = f"⚠️ Could not load this day: {exc}"
             set_controls_disabled(False)
             return
 
@@ -1314,8 +1336,10 @@ def build_app() -> pn.template.BaseTemplate:
         try:
             await loop.run_in_executor(
                 None, lambda: state.load_hour(on_progress=on_progress, on_status=on_status))
-        except ConnectionError as exc:
-            status.object = f"⚠️ {exc}"
+        except Exception as exc:
+            # See the matching except in do_load for why this is broad.
+            logger.exception("Failed to load %s %s hour %d", state.site, state.day, state.hour_index)
+            status.object = f"⚠️ Could not load hour {state.hour_index:02d} UTC: {exc}"
             set_controls_disabled(False)
             return
         status.object = load_status_message()

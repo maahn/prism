@@ -10,6 +10,8 @@ monkeypatch rpgpy.read_rpg to return the same SHAPE of header/data dict for
 each polarization mode and check ensure_decoded()'s own branching logic,
 which is the part that actually broke.
 """
+import struct
+
 import numpy as np
 import pytest
 import zarr
@@ -100,3 +102,130 @@ def test_encode_db_parallel_matches_sequential():
     sequential = rr._encode_db(linear)
     parallel = rr._encode_db_parallel(linear, max_workers=4)
     assert np.array_equal(sequential, parallel)
+
+
+# --- Corrupted-file tail recovery ---------------------------------------
+#
+# A real Ny-Alesund file (2024-01-10, hour 11) has a corrupted tail: rpgpy's
+# own timestamp check rejects the last 64 of 1787 profiles as garbage
+# (confirmed by downloading and inspecting it directly -- checksum matched
+# what Cloudnet publishes, so it's upstream data corruption, not a download
+# bug). CloudnetPy's own answer to this (see its rpg.py: catches
+# RPGFileError per-file and just drops the whole file) is to accept total
+# data loss; _repair_truncated_tail instead recovers the good prefix by
+# reverse-engineering rpgpy's own LV0 record layout (from its data.pyx) well
+# enough to find exactly where the file desyncs, truncate there, and patch
+# the header's own sample count down to match.
+#
+# These tests build a hand-crafted sample-records region (NOT a real,
+# rpgpy-parseable header -- see the "IMPORTANT" note below) so
+# _scan_sample_records/_find_corruption_boundary/_repair_truncated_tail's
+# own boundary-finding logic can be tested without a real, multi-GB RPG
+# file. The full pipeline against a REAL corrupted file (rpgpy actually
+# succeeding on the repaired output) is instead covered by the opt-in
+# tests/test_network_smoke.py, since that needs bytes only rpgpy's own
+# format truly produces.
+
+def _fake_header(n_levels=2, n_doppler=4, start_time=1000, stop_time=1010):
+    return {
+        "RAltN": n_levels, "TAltN": 0, "HAltN": 0, "DualPol": 0, "CompEna": 0,
+        "AntiAlias": 0, "RngOffs": np.array([0]), "SpecN": np.array([n_doppler]),
+        "StartTime": start_time, "StopTime": stop_time, "HeaderLen": 16,
+    }
+
+
+def _build_fake_records(header, times) -> bytes:
+    """The sample-records region of an LV0-like file for a
+    compression=0/DualPol=0/AntiAlias=0 header -- exactly what
+    _scan_sample_records expects to walk. IMPORTANT: this is NOT a
+    real/rpgpy-parseable file (the header bytes are arbitrary padding) --
+    it only needs to satisfy our OWN _scan_sample_records, which is what's
+    under test here."""
+    n_levels = int(header["RAltN"])
+    n_dummy = 3 + int(header["TAltN"]) + 2 * int(header["HAltN"]) + n_levels
+    n_points = rr._n_points_per_level(header)
+    out = bytearray()
+    for t in times:
+        out += struct.pack("<i", 0)  # SampBytes (unused by our code)
+        out += struct.pack("<I", t)  # Time
+        out += struct.pack("<i", 0)  # MSec
+        out += struct.pack("<b", 0)  # QF
+        out += bytes(4 * 17)  # RR..PCT (10 + 7 floats)
+        out += bytes(n_dummy * 4)
+        out += bytes(n_levels * 4)  # SLv
+        out += bytes([1] * n_levels)  # is_data: every level present
+        for alt_ind in range(n_levels):
+            out += struct.pack("<i", 0)  # per-level unconditional int
+            out += bytes(int(n_points[alt_ind]) * 4)  # TotSpec block
+    return bytes(out)
+
+
+def _write_fake_file(tmp_path, header, times):
+    path = tmp_path / "fake.lv0"
+    header_len = header["HeaderLen"]
+    with open(path, "wb") as f:
+        f.write(struct.pack("<i", 0))  # FileCode (unused by our code)
+        f.write(struct.pack("<i", header_len))
+        f.write(bytes(header_len))
+        f.write(struct.pack("<i", len(times)))
+        f.write(_build_fake_records(header, times))
+    return path
+
+
+def test_find_corruption_boundary_recovers_contiguous_tail(tmp_path):
+    header = _fake_header()
+    times = [1000, 1002, 1004, 1006, 1008, 1010, 99999, 88888]  # last 2 out of range
+    path = _write_fake_file(tmp_path, header, times)
+    result = rr._find_corruption_boundary(path, header)
+    assert result is not None
+    n_good, _corruption_offset, n_total = result
+    assert (n_good, n_total) == (6, 8)
+
+
+def test_find_corruption_boundary_refuses_isolated_bad_sample(tmp_path):
+    # A single stray bad timestamp surrounded by good ones on both sides --
+    # deliberately NOT the same situation as a corrupted tail: there's no
+    # reliable way to know what the correct value should have been, so this
+    # must refuse to guess rather than silently drop or fabricate one
+    # profile.
+    header = _fake_header()
+    times = [1000, 1002, 99999, 1006, 1008, 1010]
+    path = _write_fake_file(tmp_path, header, times)
+    assert rr._find_corruption_boundary(path, header) is None
+
+
+def test_find_corruption_boundary_refuses_when_nothing_good(tmp_path):
+    header = _fake_header()
+    times = [99999, 88888, 77777]  # corrupted from the very first sample
+    path = _write_fake_file(tmp_path, header, times)
+    assert rr._find_corruption_boundary(path, header) is None
+
+
+def test_repair_truncated_tail_produces_a_well_formed_prefix(tmp_path):
+    header = _fake_header()
+    times = [1000, 1002, 1004, 1006, 1008, 1010, 99999, 88888]
+    path = _write_fake_file(tmp_path, header, times)
+
+    repaired = rr._repair_truncated_tail(path, header)
+    assert repaired is not None
+    tmp_out, n_good, n_total = repaired
+    try:
+        assert (n_good, n_total) == (6, 8)
+        with open(tmp_out, "rb") as f:
+            f.seek(4)
+            (header_len,) = struct.unpack("<i", f.read(4))
+            assert header_len == header["HeaderLen"]
+            f.seek(header_len, 1)
+            (n_samples,) = struct.unpack("<i", f.read(4))
+            assert n_samples == n_good  # header's own sample count was patched down
+            recovered = [t for _, t, _ in rr._scan_sample_records(f, header, n_samples)]
+        assert recovered == times[:6]  # exactly the good prefix, nothing fabricated
+    finally:
+        tmp_out.unlink()
+
+
+def test_repair_truncated_tail_none_when_unrecoverable(tmp_path):
+    header = _fake_header()
+    times = [1000, 99999, 1004]  # isolated bad sample -- not a recoverable signature
+    path = _write_fake_file(tmp_path, header, times)
+    assert rr._repair_truncated_tail(path, header) is None

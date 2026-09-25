@@ -13,12 +13,16 @@ time-series-at-one-range query hit a single chunk:
 from __future__ import annotations
 
 import os
+import struct
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import rpgpy
+import rpgpy.header
 import zarr
 
 # RPG instrument software timestamps are seconds since 2001-01-01T00:00:00Z,
@@ -132,14 +136,203 @@ def _zarr_cache_path(lv0_path: Path, cache_dir: Path) -> Path:
     return cache_dir / "spectra_zarr" / f"{lv0_path.stem}.zarr"
 
 
-def ensure_decoded(lv0_path: Path, cache_dir: Path) -> Path:
+def _n_points_per_level(header: dict) -> np.ndarray:
+    """How many Doppler bins are stored for each range gate -- mirrors
+    rpgpy's own (private) _get_n_samples in data.pyx, which is a pure
+    function of header fields (chirp boundaries and per-chirp bin counts),
+    not of anything actually written per-sample."""
+    array = np.ones(int(header["RAltN"]), dtype=int)
+    sub_arrays = np.split(array, np.asarray(header["RngOffs"])[1:])
+    for sub_array, scale in zip(sub_arrays, header["SpecN"]):
+        sub_array *= scale
+    return np.concatenate(sub_arrays)
+
+
+def _scan_sample_records(f, header: dict, n_samples: int):
+    """Replicates rpgpy's data.pyx per-sample LV0 byte layout closely enough
+    to walk sample records in pure Python WITHOUT decoding the spectral
+    data -- just seeking past it -- so a corrupted file's exact byte offset
+    can be found without needing the C reader to succeed first.
+
+    Yields (sample_index, time_value, record_start_offset) for each sample.
+    Returns (stops iterating) early if a read comes up short, which the
+    caller treats as "can't safely characterize this file any further".
+
+    Mirrors every compression (0/1/2) and polarization (0/1/2) branch of
+    _read_rpg_l0, but has only been exercised end-to-end against a real
+    compression=0, single-polarization file (a corrupted Ny-Alesund hour --
+    see tests/test_network_smoke.py). The other branches are written from
+    the data.pyx source, not verified against a real file of that kind.
+    _repair_truncated_tail's own self-consistency requirement (every
+    sample from the first bad one through EOF must also be bad) is the
+    guard against silently trusting a mis-parsed offset from an untested
+    branch: a coding mistake here would make the "good" prefix look
+    smaller or larger than it really is, not band-aid over it.
+    """
+    n_levels = int(header["RAltN"])
+    polarization = int(header["DualPol"])
+    compression = int(header["CompEna"])
+    anti_alias = int(header["AntiAlias"])
+    n_dummy = 3 + int(header["TAltN"]) + 2 * int(header["HAltN"]) + n_levels
+    if polarization > 0:
+        n_dummy += n_levels
+    n_points = _n_points_per_level(header)
+
+    for sample in range(n_samples):
+        rec_start = f.tell()
+        prefix = f.read(8)  # SampBytes (unused here), Time
+        if len(prefix) < 8:
+            return
+        (time_val,) = struct.unpack("<I", prefix[4:8])
+        yield sample, time_val, rec_start
+
+        f.seek(4 + 1 + 4 * 17, 1)  # MSec, QF, RR..PCT (10 + 7 floats)
+        f.seek(n_dummy * 4, 1)
+        f.seek(n_levels * 4, 1)  # SLv
+        if polarization > 0:
+            f.seek(n_levels * 4, 1)  # SLh
+        is_data = f.read(n_levels)
+        if len(is_data) < n_levels:
+            return
+
+        for alt_ind in range(n_levels):
+            if is_data[alt_ind] != 1:
+                continue
+            f.seek(4, 1)  # unconditional per-level int preceding spectral data
+            n = int(n_points[alt_ind])
+            if compression == 0:
+                n_channels = 4 if polarization > 0 else 1  # Tot(+H+ReVH+ImVH)
+                f.seek(n * 4 * n_channels, 1)
+                continue
+            nb_byte = f.read(1)
+            if not nb_byte:
+                return
+            n_blocks = nb_byte[0]
+            idx_bytes = f.read(4 * n_blocks)
+            if len(idx_bytes) < 4 * n_blocks:
+                return
+            min_ind = struct.unpack(f"<{n_blocks}h", idx_bytes[: 2 * n_blocks])
+            max_ind = struct.unpack(f"<{n_blocks}h", idx_bytes[2 * n_blocks:])
+            block_points = sum(hi - lo + 1 for lo, hi in zip(min_ind, max_ind))
+            n_channels = 1  # TotSpec
+            if polarization > 0:
+                n_channels += 3  # HSpec, ReVHSpec, ImVHSpec
+            if compression == 2:
+                n_channels += 3  # RefRat, CorrCoeff, DiffPh
+            if compression == 2 and polarization == 2:
+                n_channels += 2  # SLDR, SCorrCoeff (block-shaped)
+            f.seek(block_points * 4 * n_channels, 1)
+            if compression == 2 and polarization == 2:
+                f.seek(4 + 4, 1)  # KDP, DiffAtt (one scalar each, per level)
+            f.seek(4, 1)  # TotNoisePow
+            if polarization > 0:
+                f.seek(4, 1)  # HNoisePow
+            if anti_alias == 1:
+                f.seek(1 + 4, 1)  # AliasMsk, MinVel
+
+
+def _find_corruption_boundary(lv0_path: Path, header: dict) -> tuple[int, int, int] | None:
+    """Finds where a file that failed rpgpy's own timestamp check first goes
+    bad. Returns (n_good_samples, corruption_byte_offset, n_total_samples)
+    ONLY when every single sample from the first bad one through the end of
+    the file is also out of range -- the exact signature confirmed on a
+    real corrupted Ny-Alesund file (2024-01-10, hour 11: the last 64 of
+    1787 profiles were garbage, everything before was fine). That signature
+    means the file's tail is genuinely gone, not that one stray value needs
+    guessing at.
+
+    Returns None if nothing is salvageable (corruption at sample 0), the
+    failure doesn't match that all-bad-to-EOF signature (a single bad
+    timestamp surrounded by good ones is a DIFFERENT situation this
+    deliberately does not attempt -- there'd be no reliable way to know
+    what the correct value should have been), or the scan itself runs into
+    something it can't interpret.
+    """
+    start_time, stop_time = int(header["StartTime"]), int(header["StopTime"])
+    try:
+        with open(lv0_path, "rb") as f:
+            f.seek(4)  # FileCode
+            (header_len,) = struct.unpack("<i", f.read(4))
+            f.seek(header_len, 1)
+            (n_samples,) = struct.unpack("<i", f.read(4))
+
+            first_bad = None
+            bad_count = 0
+            for sample, time_val, rec_start in _scan_sample_records(f, header, n_samples):
+                if not (start_time <= time_val <= stop_time):
+                    if first_bad is None:
+                        first_bad = (sample, rec_start)
+                    bad_count += 1
+    except (struct.error, IndexError, ValueError, OSError):
+        return None
+
+    if first_bad is None or first_bad[0] == 0:
+        return None
+    bad_sample, corruption_offset = first_bad
+    if bad_count != n_samples - bad_sample:
+        return None
+    return bad_sample, corruption_offset, n_samples
+
+
+def _repair_truncated_tail(lv0_path: Path, header: dict) -> tuple[Path, int, int] | None:
+    """If the file matches _find_corruption_boundary's narrow recovery
+    signature, writes a truncated copy (everything up to the corruption,
+    with the header's own sample count patched down to match) to a temp
+    file and returns (temp_path, n_good_samples, n_total_samples) -- the
+    caller is responsible for deleting it. Returns None if unrecoverable."""
+    found = _find_corruption_boundary(lv0_path, header)
+    if found is None:
+        return None
+    n_good, corruption_offset, n_total = found
+    n_samples_field_offset = 8 + int(header["HeaderLen"])
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".lv0")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    with open(lv0_path, "rb") as src, open(tmp_path, "wb") as dst:
+        remaining = corruption_offset
+        while remaining > 0:
+            chunk = src.read(min(1 << 20, remaining))
+            if not chunk:
+                break
+            dst.write(chunk)
+            remaining -= len(chunk)
+        dst.seek(n_samples_field_offset)
+        dst.write(struct.pack("<i", n_good))
+    return tmp_path, n_good, n_total
+
+
+def ensure_decoded(lv0_path: Path, cache_dir: Path, on_status: Callable[[str], None] | None = None) -> Path:
     """Decode an LV0 file into a chunked zarr store, if not already cached."""
     out = _zarr_cache_path(lv0_path, cache_dir)
     done_marker = out / "_SUCCESS"
     if done_marker.exists():
         return out
 
-    header, data = rpgpy.read_rpg(str(lv0_path))
+    recovered = None  # (n_good, n_total) if a corrupted tail was truncated
+    try:
+        header, data = rpgpy.read_rpg(str(lv0_path))
+    except rpgpy.RPGFileError:
+        probe_header, _ = rpgpy.header.read_rpg_header(str(lv0_path))
+        # NOTE: read_rpg_header's own returned file-position has been
+        # observed to be wrong on a real corrupted file (it reported EOF
+        # instead of the true post-header offset) -- _find_corruption_
+        # boundary/_scan_sample_records deliberately never rely on it,
+        # recomputing the post-header offset the same way data.pyx does
+        # (FileCode + HeaderLen + seek), using this dict only for field
+        # values (StartTime, RAltN, DualPol, etc.), which matched reality.
+        repaired = _repair_truncated_tail(lv0_path, probe_header)
+        if repaired is None:
+            raise
+        tmp_path, n_good, n_total = repaired
+        try:
+            header, data = rpgpy.read_rpg(str(tmp_path))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        recovered = (n_good, n_total)
+        if on_status:
+            on_status(f"⚠️ {lv0_path.name} is corrupted after profile {n_good}/{n_total} -- "
+                      f"recovered the first {n_good}, discarded the rest.")
 
     # Only a dual-pol STSR (simultaneous transmit/receive) radar -- RPG's
     # own header flags this as DualPol==2 -- exports HSpec and ReVHSpec at
@@ -192,6 +385,13 @@ def ensure_decoded(lv0_path: Path, cache_dir: Path) -> Path:
         store.create_array(f"{name}_byRange", data=codes, chunks=(n_time, 1, n_doppler))
 
     store.attrs["source_file"] = lv0_path.name
+    if recovered is not None:
+        n_good, n_total = recovered
+        # Recorded persistently (not just via on_status, which only reaches
+        # whoever happened to be watching the live status text) so a
+        # truncated hour's incompleteness is inspectable later from the
+        # cache alone -- see SpectraHour.truncated_from_corruption.
+        store.attrs["truncated_from_corruption"] = {"kept_samples": n_good, "expected_samples": n_total}
     done_marker.write_text("ok")
     return out
 
@@ -210,6 +410,12 @@ class SpectraHour:
             velocity_vectors=self._store["velocity_vectors"][:],
         )
         self.n_time, self.n_range, self.n_doppler = self._store["co_byTime"].shape
+        # Present only for an hour recovered from a corrupted raw file (see
+        # ensure_decoded/_repair_truncated_tail) -- {"kept_samples",
+        # "expected_samples"} -- so callers can show a persistent warning
+        # rather than relying on whoever happened to see the one-off
+        # on_status message at decode time.
+        self.truncated_from_corruption: dict | None = self._store.attrs.get("truncated_from_corruption")
 
     def _decode(self, codes: np.ndarray) -> np.ndarray:
         return _decode_db(codes, self._db_offset, self._db_scale)

@@ -121,9 +121,12 @@ def _zarr_cache_path(znc_gz_path: Path, cache_dir: Path) -> Path:
     return cache_dir / "spectra_zarr" / f"{name}.zarr"
 
 
-def ensure_decoded(znc_gz_path: Path, cache_dir: Path) -> Path:
+def ensure_decoded(znc_gz_path: Path, cache_dir: Path, on_status=None) -> Path:
     """Decode a gzip-compressed MIRA znc file into a chunked zarr store, if
-    not already cached."""
+    not already cached. on_status is accepted (but unused) only so callers
+    can invoke rpg_reader's and mira_reader's ensure_decoded through the
+    same interface -- see rpg_reader.ensure_decoded for what it's actually
+    for (reporting a corrupted-file recovery)."""
     out = _zarr_cache_path(znc_gz_path, cache_dir)
     done_marker = out / "_SUCCESS"
     if done_marker.exists():
