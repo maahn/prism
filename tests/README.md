@@ -9,6 +9,18 @@ That runs the fast unit tests only (no network access, no downloads) --
 they mock `rpgpy.read_rpg` and the Cloudnet API, and finish in a second or
 two. This is what CI / a pre-commit check should run.
 
+`tests/test_app_state.py` is the GUI-adjacent layer: it exercises
+`AppState` (src/prism/app.py), which every widget in `build_app()` reads
+and writes -- which hour a click resolves to, which catalog entry a
+dropdown choice resolves to, stub-vs-resolved product lookups. It
+deliberately does NOT drive the actual Panel widgets/callbacks
+end-to-end: those are async closures wired to Bokeh's document-locked
+event loop, and driving them without a real browser/server is heavy and
+brittle for what it buys. If a bug ever turns out to be in the wiring
+itself (a widget calling the wrong callback, say) rather than in
+`AppState`, that's the point to reach for Playwright against a running
+`panel serve` instead of extending this file.
+
 ## Network smoke test (opt-in)
 
 `tests/test_network_smoke.py` hits the real Cloudnet API and downloads real
