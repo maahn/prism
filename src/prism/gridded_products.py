@@ -482,13 +482,30 @@ def load_curtain(pv: ProductVariable, t_start=None, t_stop=None):
     return da["time"].values, np.asarray(height), values
 
 
+def site_altitude(catalog: list[ProductVariable]) -> float:
+    """Station altitude (m above mean sea level) from the first already
+    downloaded product that carries an `altitude` variable, else 0. Cloudnet
+    products' "height" is above mean sea level, but a model file's is above
+    ground, so model curtains need this to line up with everything else."""
+    for pv in catalog:
+        if pv.file_path is None or pv.product_id == "model":
+            continue
+        ds = _load_dataset(str(pv.file_path))
+        if "altitude" in ds:
+            alt = float(np.nanmean(ds["altitude"].values))
+            if np.isfinite(alt):
+                return alt
+    return 0.0
+
+
 def _model_window(ds, pv: ProductVariable, t_start, t_stop):
     """A model file is hourly, so a one-hour window holds a single sample --
     too few for an image or a curve. Like CloudnetPy's own categorize step,
     interpolate linearly in time (here per minute) between the bracketing
     forecast times so the field fills the window. The heights come from the
     file's 2D "height" (time, level) at the earlier bracketing time; they are
-    heights above ground and drift by only ~0.1% between hours."""
+    heights ABOVE GROUND (unlike Cloudnet's above-sea-level ones, see
+    site_altitude) and drift by only ~0.1% between hours."""
     da = ds[pv.var_name]
     times = da["time"].values.astype("datetime64[s]").astype("int64")
     lo = np.datetime64(t_start, "s").astype("int64")

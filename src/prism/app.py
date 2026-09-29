@@ -876,6 +876,7 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
     elif pv.product_id == "model":
         # Model levels reach ~75 km; drawn in full they would stretch the
         # shared height axis far past everything else in the row.
+        height_arr = height_arr + gp.site_altitude(state.catalog)  # above ground -> above sea level
         keep = height_arr <= state.spectra.height.max()
         height_arr, values = height_arr[keep], values[:, keep]
     height_arr, values = gp.to_uniform_height(height_arr, values)

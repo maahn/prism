@@ -196,3 +196,20 @@ def test_model_variables_are_offered_from_the_model_endpoint():
     assert by_name["temperature"].catalog_id == "model:temperature#ecmwf"
     assert by_name["temperature"].height_dim == "height"  # stubs use the generic name; a real scan finds "level"
     assert by_name["sfc_temp_2m"].height_dim is None
+
+
+def test_site_altitude_comes_from_a_downloaded_product_not_the_model(tmp_path):
+    # Cloudnet products' "height" is above sea level but a model file's is
+    # above ground; the difference is the station altitude.
+    import numpy as np
+    import xarray as xr
+    path = tmp_path / "categorize.nc"
+    xr.Dataset({"altitude": ((), 19.0), "Z": (("time",), np.zeros(2))},
+               coords={"time": np.array(["2024-01-10T11:00", "2024-01-10T11:10"], dtype="datetime64[ns]")}
+               ).to_netcdf(path)
+    real = gp.ProductVariable("categorize:Z", "categorize", "Z", "Z", "dBZ", path, "categorize (combined)", None)
+    stub = gp.ProductVariable("radar:Zh#x", "radar", "Zh", "Zh", "dBZ", None, "x", "height")
+    model = _model_pv("temperature", _model_file(tmp_path), "level")
+
+    assert gp.site_altitude([stub, model, real]) == 19.0
+    assert gp.site_altitude([stub, model]) == 0.0  # nothing downloaded to read it from
