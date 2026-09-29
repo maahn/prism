@@ -49,3 +49,21 @@ def test_is_raw_spectra_file_mira():
     assert _is_raw_spectra_file("mira-10", "20260916_200006.znc.gz")
     assert _is_raw_spectra_file("mira-35", "20260916_200006.znc.gz")
     assert not _is_raw_spectra_file("mira-35", "20260916_200006_windppi.znc.gz")  # PPI scan, no vertical profile
+
+
+def test_list_model_files_uses_the_model_endpoint(monkeypatch):
+    # Model files are NOT returned by the regular "files" endpoint.
+    import datetime
+    from prism import cloudnet_client as cc
+    seen = {}
+
+    def fake_get(path, **params):
+        seen["path"], seen["params"] = path, params
+        return [{"uuid": "u", "filename": "20240110_ny-alesund_ecmwf.nc", "size": "465908", "checksum": "abc",
+                 "downloadUrl": "http://example.invalid/x.nc", "model": {"id": "ecmwf"}}]
+
+    monkeypatch.setattr(cc, "_get", fake_get)
+    (remote,) = cc.list_model_files("ny-alesund", datetime.date(2024, 1, 10))
+    assert seen["path"] == "model-files" and seen["params"]["dateFrom"] == "2024-01-10"
+    assert (remote.product_id, remote.instrument_id, remote.kind) == ("model", "ecmwf", "product")
+    assert remote.size == 465908

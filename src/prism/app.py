@@ -873,6 +873,11 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
         # padding indistinguishable from the real curtain panels'.
         height_arr = state.spectra.height if state.spectra is not None else np.array([0.0, 1000.0])
         values = np.full((len(time_arr), len(height_arr)), np.nan)
+    elif pv.product_id == "model":
+        # Model levels reach ~75 km; drawn in full they would stretch the
+        # shared height axis far past everything else in the row.
+        keep = height_arr <= state.spectra.height.max()
+        height_arr, values = height_arr[keep], values[:, keep]
     height_arr, values = gp.to_uniform_height(height_arr, values)
 
     title = f"{pv.label} ({pv.units})" if pv.units else pv.label

@@ -34,10 +34,11 @@ CANDIDATE_PRODUCTS = {
     "mwr",  # time-only products, e.g. liquid water path (lwp)
     "mwr-multi",  # HATPRO temperature/humidity profiles
     "disdrometer",  # time-only series; the drop-size spectra have no height axis and are skipped
+    "model",  # numerical weather model (e.g. ecmwf); listed via a separate API endpoint
 }
 
 # A variable qualifies as a "curtain" if its dims look like (time, <height>).
-HEIGHT_DIM_NAMES = {"height", "range"}
+HEIGHT_DIM_NAMES = {"height", "range", "level"}  # "level": model files, heights in the 2D "height" variable
 
 # Site/instrument housekeeping fields that are always constant over an hour
 # (position, hardware calibration, temperatures inside the enclosure, ...).
@@ -57,13 +58,16 @@ CONSTANT_VARIABLE_NAMES = {
     "time_ms",
     # disdrometer housekeeping
     "V_power_supply", "I_heating", "sig_laser", "interval",
+    # model files: "height" is the model's own 2D height coordinate stored as
+    # a data variable, the rest never change over a day
+    "height", "forecast_time", "sfc_land_cover", "sfc_roughness_length", "sfc_geopotential",
 }
 
 # plot_meta's colour ranges for these (ported from CloudnetPy's plotting)
 # are in degrees C, but the product files store kelvin -- CloudnetPy
 # converts at plot time, so this viewer must too, or the fixed (-50, 50)
 # range paints the whole panel one saturated colour.
-KELVIN_TO_CELSIUS_VARS = {"temperature", "Tw"}
+KELVIN_TO_CELSIUS_VARS = {"temperature", "Tw", "sfc_temp_2m", "sfc_dewpoint_temp_2m"}
 
 
 def _display_units(var_name: str, units: str) -> str:
@@ -175,6 +179,23 @@ PRODUCT_SCHEMA: dict[str, dict[str, VarSchema]] = {
         "n_particles": VarSchema("Number of particles in time interval", "1", False),
         "synop_WaWa": VarSchema("Synop code WaWa", "1", False),
     },
+    "model": {
+        "temperature": VarSchema("Temperature", "K", True),
+        "pressure": VarSchema("Pressure", "Pa", True),
+        "rh": VarSchema("Relative humidity", "1", True),
+        "q": VarSchema("Specific humidity", "1", True),
+        "uwind": VarSchema("Zonal wind", "m s-1", True),
+        "vwind": VarSchema("Meridional wind", "m s-1", True),
+        "wwind": VarSchema("Vertical wind", "m s-1", True),
+        "cloud_fraction": VarSchema("Cloud fraction", "1", True),
+        "ql": VarSchema("Gridbox-mean liquid water mixing ratio", "1", True),
+        "qi": VarSchema("Gridbox-mean ice water mixing ratio", "1", True),
+        "sfc_temp_2m": VarSchema("Temperature at 2m", "K", False),
+        "sfc_pressure": VarSchema("Surface pressure", "Pa", False),
+        "sfc_wind_gust_10m": VarSchema("Wind gust at 10 m", "m s-1", False),
+        "sfc_bl_height": VarSchema("Boundary layer height", "m", False),
+        "sfc_cloud_fraction": VarSchema("Surface total cloud fraction", "1", False),
+    },
     "epsilon-radar": {
         "epsilon": VarSchema("Dissipation rate of turbulent kinetic energy", "m2 s-3", True),
         "epsilon_error": VarSchema("Absolute error in dissipation rate of turbulent kinetic energy", "m2 s-3", True),
@@ -265,6 +286,10 @@ def discover(
     forwarded to each eager download so the caller can drive a status line.
     """
     remotes = [r for r in cc.list_product_files(site, day) if r.product_id in CANDIDATE_PRODUCTS]
+    try:
+        remotes += cc.list_model_files(site, day)
+    except Exception:
+        pass  # model data is optional; never let it block everything else
     catalog: list[ProductVariable] = []
     for remote in remotes:
         if remote.product_id in eager_products:
@@ -440,19 +465,49 @@ def load_curtain(pv: ProductVariable, t_start=None, t_stop=None):
     product on demand before ever reaching here."""
     ds = _load_dataset(str(pv.file_path))
     da = ds[pv.var_name]
+    to_celsius = pv.var_name in KELVIN_TO_CELSIUS_VARS and da.attrs.get("units") == "K"
+    if pv.product_id == "model" and t_start is not None and t_stop is not None:
+        times, height, values = _model_window(ds, pv, t_start, t_stop)
+        return times, height, values - 273.15 if to_celsius else values
     if t_start is not None and t_stop is not None:
         da = da.sel(time=slice(t_start, t_stop))
-    values = da.values
-    if pv.var_name in KELVIN_TO_CELSIUS_VARS and ds[pv.var_name].attrs.get("units") == "K":
-        values = values - 273.15
+    values = da.values - 273.15 if to_celsius else da.values
     if pv.height_dim is None:
         return da["time"].values, None, values
-    height = ds[pv.height_dim].values
+    height = ds["height" if pv.height_dim == "level" else pv.height_dim].values
     # height/range can itself be time-varying in some products; if so, use
     # the first profile as a static axis (adequate for a single-hour view).
     if height.ndim > 1:
         height = height[0]
     return da["time"].values, np.asarray(height), values
+
+
+def _model_window(ds, pv: ProductVariable, t_start, t_stop):
+    """A model file is hourly, so a one-hour window holds a single sample --
+    too few for an image or a curve. Like CloudnetPy's own categorize step,
+    interpolate linearly in time (here per minute) between the bracketing
+    forecast times so the field fills the window. The heights come from the
+    file's 2D "height" (time, level) at the earlier bracketing time; they are
+    heights above ground and drift by only ~0.1% between hours."""
+    da = ds[pv.var_name]
+    times = da["time"].values.astype("datetime64[s]").astype("int64")
+    lo = np.datetime64(t_start, "s").astype("int64")
+    hi = np.datetime64(t_stop, "s").astype("int64")
+    new = np.unique(np.append(np.arange(lo, hi, 60), hi))
+    vals = da.values
+    if len(times) == 1:
+        left = np.zeros(len(new), dtype=int)
+        out = np.repeat(vals, len(new), axis=0)
+    else:
+        right = np.clip(np.searchsorted(times, new), 1, len(times) - 1)
+        left = right - 1
+        w = np.clip((new - times[left]) / (times[right] - times[left]), 0.0, 1.0)
+        w = w.reshape((-1,) + (1,) * (vals.ndim - 1))
+        out = vals[left] * (1 - w) + vals[right] * w
+    new_times = new.astype("datetime64[s]").astype("datetime64[ns]")
+    if pv.height_dim is None:
+        return new_times, None, out
+    return new_times, np.asarray(ds["height"].values[int(left[0])]), out
 
 
 def to_uniform_height(height: np.ndarray, values: np.ndarray, max_rows: int = 4000):

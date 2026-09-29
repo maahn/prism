@@ -165,6 +165,28 @@ def list_product_files(site: str, day: date) -> list[RemoteFile]:
     ]
 
 
+def list_model_files(site: str, day: date) -> list[RemoteFile]:
+    """List the numerical-weather-model files (e.g. ECMWF) Cloudnet holds for
+    one site and day. These are NOT returned by the regular "files"
+    endpoint, hence the separate call; the model's id (e.g. "ecmwf") stands
+    in for the instrument."""
+    day_str = day.isoformat()
+    data = _get("model-files", site=site, dateFrom=day_str, dateTo=day_str)
+    return [
+        RemoteFile(
+            uuid=f["uuid"],
+            filename=f["filename"],
+            size=int(f["size"]),
+            checksum=f["checksum"],
+            download_url=f["downloadUrl"],
+            instrument_id=f["model"]["id"],
+            kind="product",
+            product_id="model",
+        )
+        for f in data
+    ]
+
+
 def cache_path_for(remote: RemoteFile, cache_dir: Path = DEFAULT_CACHE_DIR) -> Path:
     subdir = "raw" if remote.kind == "raw" else "products"
     return cache_dir / subdir / remote.checksum[:2] / f"{remote.checksum}_{remote.filename}"

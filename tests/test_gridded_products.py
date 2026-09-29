@@ -149,3 +149,50 @@ def test_load_curtain_converts_kelvin_temperature_to_celsius(tmp_path):
     assert np.allclose(temp, -20.0)
     _, _, theta = gp.load_curtain(pv("potential_temperature", "K"))
     assert np.allclose(theta, 300.0)  # only the °C-scaled names are converted
+
+
+def _model_file(tmp_path):
+    import numpy as np
+    import xarray as xr
+    times = np.array(["2024-01-10T11:00", "2024-01-10T12:00"], dtype="datetime64[ns]")
+    ds = xr.Dataset(
+        {"temperature": (("time", "level"), np.array([[280.0, 270.0], [290.0, 280.0]]), {"units": "K"}),
+         "sfc_temp_2m": (("time",), np.array([270.0, 280.0]), {"units": "K"}),
+         "height": (("time", "level"), np.array([[10.0, 1000.0], [12.0, 1010.0]]), {"units": "m"})},
+        coords={"time": times, "level": [1, 2]})
+    path = tmp_path / "model.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+def _model_pv(name, path, height_dim):
+    return gp.ProductVariable(catalog_id=f"model:{name}#ecmwf", product_id="model", var_name=name, label=name,
+                               units="", file_path=path, instrument_id="ecmwf", height_dim=height_dim)
+
+
+def test_model_hourly_file_is_interpolated_across_the_window(tmp_path):
+    # An hourly model file has ONE sample inside a one-hour window -- too few
+    # for an image or a curve, so it is interpolated linearly in time.
+    import numpy as np
+    path = _model_file(tmp_path)
+    t0, t1 = np.datetime64("2024-01-10T11:00:00"), np.datetime64("2024-01-10T11:30:00")
+
+    times, height, temp = gp.load_curtain(_model_pv("temperature", path, "level"), t0, t1)
+
+    assert len(times) == 31 and times[0] == t0 and times[-1] == t1  # per minute, exact endpoints
+    assert np.allclose(height, [10.0, 1000.0])  # heights from the 2D "height" field, not level numbers
+    assert np.allclose(temp[0], np.array([280.0, 270.0]) - 273.15)  # K -> degrees C
+    assert np.allclose(temp[-1], np.array([285.0, 275.0]) - 273.15)  # halfway to the 12:00 sample
+
+    _, no_height, surface = gp.load_curtain(_model_pv("sfc_temp_2m", path, None), t0, t1)
+    assert no_height is None and np.isclose(surface[-1], 275.0 - 273.15)
+
+
+def test_model_variables_are_offered_from_the_model_endpoint():
+    assert "model" in gp.CANDIDATE_PRODUCTS and "level" in gp.HEIGHT_DIM_NAMES
+    remote = RemoteFile(uuid="u", filename="f.nc", size=1, checksum="c", download_url="http://example.invalid",
+                        instrument_id="ecmwf", kind="product", product_id="model")
+    by_name = {pv.var_name: pv for pv in gp._stub_remote(remote)}
+    assert by_name["temperature"].catalog_id == "model:temperature#ecmwf"
+    assert by_name["temperature"].height_dim == "height"  # stubs use the generic name; a real scan finds "level"
+    assert by_name["sfc_temp_2m"].height_dim is None
