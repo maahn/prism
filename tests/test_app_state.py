@@ -179,3 +179,18 @@ def test_load_hour_propagates_decode_failure_without_mutating_spectra(settings, 
     # The prior hour's data must still be there for the UI to fall back to
     # (or at least not be silently cleared) -- not left half-updated.
     assert state.spectra is previous_spectra
+
+
+def test_effective_channel_falls_back_to_co_without_a_cross_channel():
+    # A saved "cross" preference on a single-pol radar (Ny-Alesund, Julich)
+    # used to render completely blank spectrograms -- the cross arrays are
+    # fully masked there.
+    from prism.app import _effective_channel
+
+    class Hour:
+        def __init__(self, has_cross):
+            self.has_cross = has_cross
+
+    assert _effective_channel(Hour(False), "cross") == ("co", ", no cross")
+    assert _effective_channel(Hour(True), "cross") == ("cross", "")
+    assert _effective_channel(Hour(False), "co") == ("co", "")

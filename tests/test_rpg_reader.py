@@ -229,3 +229,17 @@ def test_repair_truncated_tail_none_when_unrecoverable(tmp_path):
     times = [1000, 99999, 1004]  # isolated bad sample -- not a recoverable signature
     path = _write_fake_file(tmp_path, header, times)
     assert rr._repair_truncated_tail(path, header) is None
+
+
+@pytest.mark.parametrize("dual_pol_stsr,ldr_mode,expected", [
+    (True, False, True),
+    (False, True, True),
+    (False, False, False),  # single-pol: cross arrays are written fully masked
+])
+def test_spectra_hour_has_cross_only_when_radar_has_one(tmp_path, monkeypatch, dual_pol_stsr, ldr_mode, expected):
+    header, data = _make_header_data(dual_pol_stsr=dual_pol_stsr, ldr_mode=ldr_mode)
+    monkeypatch.setattr(rr.rpgpy, "read_rpg", lambda path: (header, dict(data)))
+    lv0 = tmp_path / "fake_260101_000000_P01_ZEN.LV0"
+    lv0.write_bytes(b"x")
+    hour = rr.SpectraHour(rr.ensure_decoded(lv0, tmp_path / "cache"))
+    assert hour.has_cross is expected

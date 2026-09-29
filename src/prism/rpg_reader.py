@@ -417,6 +417,20 @@ class SpectraHour:
         # on_status message at decode time.
         self.truncated_from_corruption: dict | None = self._store.attrs.get("truncated_from_corruption")
 
+    @property
+    def has_cross(self) -> bool:
+        """False for a radar with no cross-polar channel at all (a
+        single-polarization radar, e.g. Julich or Ny-Alesund, or a MIRA
+        without SPCcx) -- its cross arrays are written fully masked. Probed
+        from three whole profiles rather than the full array; a real cross
+        channel always carries a noise floor, so any of them being
+        non-masked is enough."""
+        if not hasattr(self, "_has_cross"):
+            arr = self._store["cross_byTime"]
+            idx = sorted({0, self.n_time // 2, self.n_time - 1})
+            self._has_cross = any(bool((arr[i] != MASK_CODE).any()) for i in idx)
+        return self._has_cross
+
     def _decode(self, codes: np.ndarray) -> np.ndarray:
         return _decode_db(codes, self._db_offset, self._db_scale)
 

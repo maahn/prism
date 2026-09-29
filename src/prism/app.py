@@ -1033,6 +1033,16 @@ def _no_data_range_spectrogram():
     return hv.Overlay([img])
 
 
+def _effective_channel(spectra, channel: str) -> tuple[str, str]:
+    """A saved "cross" preference (meant for a dual-pol radar) applied to an
+    hour with no cross channel at all (single-pol radar) used to render
+    completely blank spectrograms. Falls back to co, saying so in the title,
+    without touching the persisted preference or the toggle."""
+    if channel == "cross" and not spectra.has_cross:
+        return "co", ", no cross"
+    return channel, ""
+
+
 def _range_spectrogram(state: AppState, channel: str):
     """Content legitimately changes on every click (a different time's
     profile); the axes are managed by _make_range_hook, not by HoloViews.
@@ -1055,8 +1065,9 @@ def _range_spectrogram(state: AppState, channel: str):
     if s is None or state.selected_time is None:
         return _no_data_range_spectrogram()
     t_idx = s.nearest_time_index(state.selected_time)
+    channel, note = _effective_channel(s, channel)
     segments = s.range_profile_segments(t_idx, channel)
-    title = f"Range spectrogram ({channel})"
+    title = f"Range spectrogram ({channel}{note})"
     images = [
         hv.Image((vel, s.height[rng_slice], block), kdims=["velocity", "height"], vdims=["power"]).opts(
             cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
@@ -1090,13 +1101,14 @@ def _time_spectrogram(state: AppState, channel: str):
     if s is None or state.selected_height is None:
         return _no_data_time_spectrogram(state)
     r_idx = s.nearest_range_index(state.selected_height)
+    channel, note = _effective_channel(s, channel)
     block = s.time_series(r_idx, 0, s.n_time, channel)
     vel = s.chirp.velocity_axis(r_idx)
     times = np.array([np.datetime64(int(x), "s") for x in s.time])
     return hv.Image((times, vel, block.T), kdims=["time", "velocity"], vdims=["power"]).opts(
         cmap="viridis", colorbar=True, tools=["hover", "tap"], active_tools=["tap", "wheel_zoom"],
         responsive=True,
-        title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel})", apply_ranges=False,
+        title=f"Time spectrogram at {s.height[r_idx]:.0f} m ({channel}{note})", apply_ranges=False,
         xlabel="time (UTC)", ylabel="Doppler velocity (m/s)",
     )
 
