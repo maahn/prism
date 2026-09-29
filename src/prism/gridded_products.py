@@ -425,6 +425,24 @@ def load_curtain(pv: ProductVariable, t_start=None, t_stop=None):
     return da["time"].values, np.asarray(height), da.values
 
 
+def to_uniform_height(height: np.ndarray, values: np.ndarray, max_rows: int = 4000):
+    """Resample a (time, height) curtain onto an evenly spaced height grid by
+    nearest gate. An hv.Image lays its rows out evenly by INDEX, so feeding
+    it a radar grid whose gate spacing changes with height (RPG-FMCW-94:
+    3 m in the lowest chirp up to 32 m in the highest) stretched the upper
+    gates: a real 4247 m cloud top was drawn at ~7400 m and every clicked
+    height was off by the same distortion. Already-uniform grids (Cloudnet
+    products on a fixed grid) are returned untouched."""
+    height = np.asarray(height, dtype=float)
+    gaps = np.diff(height)
+    if gaps.size == 0 or np.allclose(gaps, gaps[0], rtol=0.05):
+        return height, values
+    step = max(float(gaps[gaps > 0].min()), (height[-1] - height[0]) / max_rows)
+    grid = np.arange(height[0], height[-1] + step / 2, step)
+    nearest_gate = np.searchsorted((height[1:] + height[:-1]) / 2, grid)
+    return grid, values[:, nearest_gate]
+
+
 def nearest_index(coord: np.ndarray, value) -> int:
     return int(np.argmin(np.abs(coord.astype("int64") - np.asarray(value).astype("int64")))) \
         if np.issubdtype(coord.dtype, np.datetime64) else int(np.argmin(np.abs(coord - value)))

@@ -873,6 +873,7 @@ def _moment_image(state: AppState, index: int, catalog_id, auto_color, vmin, vma
         # padding indistinguishable from the real curtain panels'.
         height_arr = state.spectra.height if state.spectra is not None else np.array([0.0, 1000.0])
         values = np.full((len(time_arr), len(height_arr)), np.nan)
+    height_arr, values = gp.to_uniform_height(height_arr, values)
 
     title = f"{pv.label} ({pv.units})" if pv.units else pv.label
     opts = dict(colorbar=True, colorbar_opts=_panel_colorbar_models(state, index),
@@ -1017,6 +1018,8 @@ def build_spectra_controls(state: AppState):
     )
 
     def on_channel(event):
+        if channel_toggle.disabled:
+            return  # forced to co by sync_channel_toggle; keep the saved preference
         state.channel = event.new
         state.settings.set("spectra_channel", event.new)
 
@@ -1146,15 +1149,29 @@ def _no_data_spectrum():
     )
 
 
+def _hide_cross_legend_entry(state: AppState):
+    def hook(plot, element):
+        has_cross = state.spectra is None or state.spectra.has_cross
+        for legend in plot.state.legend:
+            for item in legend.items:
+                if "cross-polar" in str(item.label):
+                    item.visible = has_cross
+    return hook
+
+
 def _spectrum_plot(state: AppState):
-    """Always overlays co- and cross-polar spectra (no channel dependency here)."""
+    """Overlays co- and (where the radar has one) cross-polar spectra; no
+    channel-toggle dependency here."""
     s = state.spectra
     if s is None or state.selected_time is None or state.selected_height is None:
         return _no_data_spectrum()
     t_idx = s.nearest_time_index(state.selected_time)
     r_idx = s.nearest_range_index(state.selected_height)
     vel_co, db_co = s.spectrum(t_idx, r_idx, "co")
-    vel_cx, db_cx = s.spectrum(t_idx, r_idx, "cross")
+    # No cross channel (single-pol radar): the cross curve stays in the overlay
+    # as an EMPTY curve -- a DynamicMap's frames must keep the same structure --
+    # and _hide_cross_legend_entry (a hook on spectrum_dmap) hides its legend entry.
+    vel_cx, db_cx = s.spectrum(t_idx, r_idx, "cross") if s.has_cross else ([], [])
     label = (f"Spectrum @ {s.height[r_idx]:.0f} m, "
               f"{dt.datetime.utcfromtimestamp(int(s.time[t_idx])).strftime('%H:%M:%S')} UTC")
     curve_co = hv.Curve((vel_co, db_co), kdims=["velocity"], vdims=["power"], label="co-polar").opts(color="steelblue")
@@ -1320,6 +1337,7 @@ def build_app() -> pn.template.BaseTemplate:
             status.object = load_status_message()
             show_cache_size()
             settings.set_last_session(state.site, state.day.isoformat(), state.hour_index, state.instrument)
+            sync_channel_toggle()
             state.range_generation += 1
             set_controls_disabled(False)
 
@@ -1357,6 +1375,7 @@ def build_app() -> pn.template.BaseTemplate:
         status.object = load_status_message()
         show_cache_size()
         settings.set_last_session(state.site, state.day.isoformat(), state.hour_index, state.instrument)
+        sync_channel_toggle()
         state.range_generation += 1  # refit axes for the newly loaded hour
         set_controls_disabled(False)
 
@@ -1425,6 +1444,19 @@ def build_app() -> pn.template.BaseTemplate:
 
     moment_controls = [build_moment_controls(state, i) for i in range(N_MOMENT_PANELS)]
     channel_toggle = build_spectra_controls(state)
+
+    def sync_channel_toggle():
+        """A radar with no cross channel (single-pol) gets the co/cross
+        toggle disabled and forced to co. The saved preference is never
+        overwritten (on_channel ignores events while disabled) and is
+        restored as soon as an hour with a cross channel is loaded."""
+        if state.spectra is None or state.spectra.has_cross:
+            if channel_toggle.disabled:
+                channel_toggle.disabled = False
+                channel_toggle.value = settings.get("spectra_channel")
+        else:
+            channel_toggle.disabled = True
+            channel_toggle.value = "co"
 
     def refresh_variable_options():
         """Widget options are built once from an empty catalog (before the
@@ -1565,7 +1597,8 @@ def build_app() -> pn.template.BaseTemplate:
         _spectrum_cb,
         streams=[hv.streams.Params(state, ["hour_index", "selected_time", "selected_height", "range_generation"])],
     ).opts(hv.opts.Overlay(apply_ranges=False,
-                            hooks=[_make_range_hook(state, "velocity", "power", auto_y=True)]))
+                            hooks=[_make_range_hook(state, "velocity", "power", auto_y=True),
+                                   _hide_cross_legend_entry(state)]))
 
     grid = hv.Layout(row1_dmaps + [range_dmap, time_dmap, spectrum_dmap]).cols(3).opts(shared_axes=True)
     # stretch_both (not stretch_width): the individual panels are already

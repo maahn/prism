@@ -81,3 +81,31 @@ def test_stub_remote_unknown_product_returns_empty():
                          download_url="http://example.invalid", instrument_id=None,
                          kind="product", product_id="some-future-product-type")
     assert gp._stub_remote(remote) == []
+
+
+def test_to_uniform_height_keeps_true_heights_on_a_nonuniform_radar_grid():
+    # RPG gate spacing grows with height (3 m -> 32 m across the chirps). An
+    # hv.Image spaces rows by index, so the raw grid drew a real 4247 m cloud
+    # top at ~7400 m. After resampling, the last valid gate must sit at its
+    # true height.
+    import numpy as np
+    height = np.concatenate([np.arange(100, 400, 3.0), np.arange(400, 1200, 8.0), np.arange(1200, 11000, 32.0)])
+    values = np.full((2, len(height)), np.nan)
+    top = int(np.argmin(np.abs(height - 4247)))
+    values[:, : top + 1] = 1.0
+
+    grid, resampled = gp.to_uniform_height(height, values)
+
+    assert np.allclose(np.diff(grid), np.diff(grid)[0])
+    valid_top = grid[np.isfinite(resampled[0])].max()
+    assert abs(valid_top - height[top]) <= 32  # within one coarse gate of the truth
+    # a gate keeps its own value: lowest gate maps to the first grid rows
+    assert np.isfinite(resampled[0, 0])
+
+
+def test_to_uniform_height_leaves_a_uniform_grid_alone():
+    import numpy as np
+    height = np.arange(0.0, 1000.0, 30.0)
+    values = np.random.default_rng(0).random((3, len(height)))
+    grid, out = gp.to_uniform_height(height, values)
+    assert grid is not None and out is values
