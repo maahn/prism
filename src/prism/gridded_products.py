@@ -32,6 +32,8 @@ CANDIDATE_PRODUCTS = {
     "radar", "categorize", "classification", "lidar",
     "iwc", "lwc", "drizzle", "der", "ier", "epsilon-radar",
     "mwr",  # time-only products, e.g. liquid water path (lwp)
+    "mwr-multi",  # HATPRO temperature/humidity profiles
+    "disdrometer",  # time-only series; the drop-size spectra have no height axis and are skipped
 }
 
 # A variable qualifies as a "curtain" if its dims look like (time, <height>).
@@ -53,7 +55,19 @@ CONSTANT_VARIABLE_NAMES = {
     "voltage", "pc_temperature", "receiver_temperature",
     "transmitter_temperature", "if_power", "tpow", "transmitted_power",
     "time_ms",
+    # disdrometer housekeeping
+    "V_power_supply", "I_heating", "sig_laser", "interval",
 }
+
+# plot_meta's colour ranges for these (ported from CloudnetPy's plotting)
+# are in degrees C, but the product files store kelvin -- CloudnetPy
+# converts at plot time, so this viewer must too, or the fixed (-50, 50)
+# range paints the whole panel one saturated colour.
+KELVIN_TO_CELSIUS_VARS = {"temperature", "Tw"}
+
+
+def _display_units(var_name: str, units: str) -> str:
+    return "°C" if var_name in KELVIN_TO_CELSIUS_VARS and units == "K" else units
 
 
 @dataclass(frozen=True)
@@ -147,6 +161,19 @@ PRODUCT_SCHEMA: dict[str, dict[str, VarSchema]] = {
         "lwp": VarSchema("Liquid water path", "kg m-2", False),
         "iwv": VarSchema("Integrated water vapour", "kg m-2", False),
         "zenith_angle": VarSchema("Zenith angle", "degree", False),
+    },
+    "mwr-multi": {
+        "temperature": VarSchema("Temperature", "K", True),
+        "relative_humidity": VarSchema("Relative humidity", "1", True),
+        "potential_temperature": VarSchema("Potential temperature", "K", True),
+        "equivalent_potential_temperature": VarSchema("Equivalent potential temperature", "K", True),
+    },
+    "disdrometer": {
+        "rainfall_rate": VarSchema("Rainfall rate", "m s-1", False),
+        "radar_reflectivity": VarSchema("Equivalent radar reflectivity factor", "dBZ", False),
+        "visibility": VarSchema("Visibility range in precipitation after MOR", "m", False),
+        "n_particles": VarSchema("Number of particles in time interval", "1", False),
+        "synop_WaWa": VarSchema("Synop code WaWa", "1", False),
     },
     "epsilon-radar": {
         "epsilon": VarSchema("Dissipation rate of turbulent kinetic energy", "m2 s-3", True),
@@ -335,7 +362,7 @@ def _scan_remote(remote: cc.RemoteFile, cache_dir: Path, on_progress=None) -> li
             product_id=remote.product_id,
             var_name=var_name,
             label=label,
-            units=da.attrs.get("units", ""),
+            units=_display_units(var_name, da.attrs.get("units", "")),
             file_path=path,
             instrument_id=instrument,
             height_dim=height_dim,
@@ -366,7 +393,7 @@ def _stub_remote(remote: cc.RemoteFile) -> list[ProductVariable]:
             product_id=remote.product_id,
             var_name=var_name,
             label=f"{remote.product_id}: {s.label_suffix}",
-            units=s.units,
+            units=_display_units(var_name, s.units),
             file_path=None,
             instrument_id=instrument,
             height_dim="height" if s.has_height else None,
@@ -415,14 +442,17 @@ def load_curtain(pv: ProductVariable, t_start=None, t_stop=None):
     da = ds[pv.var_name]
     if t_start is not None and t_stop is not None:
         da = da.sel(time=slice(t_start, t_stop))
+    values = da.values
+    if pv.var_name in KELVIN_TO_CELSIUS_VARS and ds[pv.var_name].attrs.get("units") == "K":
+        values = values - 273.15
     if pv.height_dim is None:
-        return da["time"].values, None, da.values
+        return da["time"].values, None, values
     height = ds[pv.height_dim].values
     # height/range can itself be time-varying in some products; if so, use
     # the first profile as a static axis (adequate for a single-hour view).
     if height.ndim > 1:
         height = height[0]
-    return da["time"].values, np.asarray(height), da.values
+    return da["time"].values, np.asarray(height), values
 
 
 def to_uniform_height(height: np.ndarray, values: np.ndarray, max_rows: int = 4000):

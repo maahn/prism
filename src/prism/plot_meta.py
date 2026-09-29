@@ -185,4 +185,5 @@ CONTINUOUS: dict[str, ContinuousMeta] = {
     "v_air": ContinuousMeta(cmap="RdBu_r", plot_range=(-2, 2)),
     "Tw": ContinuousMeta(cmap="RdBu_r", plot_range=(-50, 50)),
     "temperature": ContinuousMeta(cmap="RdBu_r", plot_range=(-50, 50)),
+    "relative_humidity": ContinuousMeta(cmap="Blues", plot_range=(0, 1)),
 }

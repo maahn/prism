@@ -109,3 +109,43 @@ def test_to_uniform_height_leaves_a_uniform_grid_alone():
     values = np.random.default_rng(0).random((3, len(height)))
     grid, out = gp.to_uniform_height(height, values)
     assert grid is not None and out is values
+
+
+def test_mwr_multi_and_disdrometer_are_offered():
+    assert {"mwr-multi", "disdrometer"} <= gp.CANDIDATE_PRODUCTS
+    mwr = RemoteFile(uuid="u", filename="f.nc", size=1, checksum="c", download_url="http://example.invalid",
+                     instrument_id="hatpro", kind="product", product_id="mwr-multi")
+    by_name = {pv.var_name: pv for pv in gp._stub_remote(mwr)}
+    # profiles have a height axis, and temperature is shown in degrees C
+    assert by_name["temperature"].height_dim == "height"
+    assert by_name["temperature"].units == "°C"
+    assert by_name["relative_humidity"].height_dim == "height"
+
+    dis = RemoteFile(uuid="u", filename="f.nc", size=1, checksum="c", download_url="http://example.invalid",
+                     instrument_id="parsivel", kind="product", product_id="disdrometer")
+    stubs = gp._stub_remote(dis)
+    assert stubs and all(pv.height_dim is None for pv in stubs)  # time series only
+
+
+def test_load_curtain_converts_kelvin_temperature_to_celsius(tmp_path):
+    # plot_meta's temperature colour range is in degrees C (ported from
+    # CloudnetPy), the product files are in K.
+    import numpy as np
+    import xarray as xr
+    times = np.array(["2024-01-10T11:00", "2024-01-10T11:10"], dtype="datetime64[ns]")
+    ds = xr.Dataset(
+        {"temperature": (("time", "height"), np.full((2, 3), 273.15 - 20.0), {"units": "K"}),
+         "potential_temperature": (("time", "height"), np.full((2, 3), 300.0), {"units": "K"})},
+        coords={"time": times, "height": [10.0, 20.0, 30.0]})
+    path = tmp_path / "mwr.nc"
+    ds.to_netcdf(path)
+
+    def pv(name, units):
+        return gp.ProductVariable(catalog_id=f"mwr-multi:{name}#hatpro", product_id="mwr-multi", var_name=name,
+                                   label=name, units=units, file_path=path, instrument_id="hatpro",
+                                   height_dim="height")
+
+    _, _, temp = gp.load_curtain(pv("temperature", "°C"))
+    assert np.allclose(temp, -20.0)
+    _, _, theta = gp.load_curtain(pv("potential_temperature", "K"))
+    assert np.allclose(theta, 300.0)  # only the °C-scaled names are converted
