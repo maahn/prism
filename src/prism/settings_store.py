@@ -32,12 +32,16 @@ DEFAULTS: dict[str, Any] = {
 
 
 class Settings:
-    def __init__(self, path: Path = DEFAULT_SETTINGS_PATH):
+    """path=None keeps everything in memory only (never reads or writes a
+    file): server mode gives every user session its own throwaway Settings,
+    since sessions must neither share nor overwrite one settings.json."""
+
+    def __init__(self, path: Path | None = DEFAULT_SETTINGS_PATH):
         self.path = path
         self._data = self._load()
 
     def _load(self) -> dict:
-        if self.path.exists():
+        if self.path is not None and self.path.exists():
             try:
                 stored = json.loads(self.path.read_text())
                 merged = copy.deepcopy(DEFAULTS)
@@ -48,6 +52,8 @@ class Settings:
         return copy.deepcopy(DEFAULTS)
 
     def save(self) -> None:
+        if self.path is None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self._data, indent=2))
 

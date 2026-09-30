@@ -27,6 +27,7 @@ from prism import gridded_products as gp
 from prism import mira_reader as mr
 from prism import plot_meta as pm
 from prism import rpg_reader as rr
+from prism import server_mode as sm
 from prism import settings_store as ss
 
 pn.extension(raw_css=["""
@@ -93,6 +94,9 @@ class AppState(param.Parameterized):
         self.catalog: list[gp.ProductVariable] = []
         self.spectra: rr.SpectraHour | None = None
         self.channel = settings.get("spectra_channel")
+        # Set by release(); background loads that finish afterwards must not
+        # put their data back.
+        self.released = False
         # Which range_generation each Bokeh range object was last fitted for.
         self.range_keys: dict[str, int] = {}
         # Which (lo, hi) an auto_y range was last fit to, for _make_range_hook
@@ -136,8 +140,11 @@ class AppState(param.Parameterized):
             stored_id = self.settings.get_panel(i)["variable"]
             if stored_id and ":" in stored_id:
                 eager.add(stored_id.split(":", 1)[0])
-        self.catalog = gp.discover(self.site, self.day, self.cache_dir,
-                                    on_progress=on_progress, eager_products=eager)
+        catalog = gp.discover(self.site, self.day, self.cache_dir,
+                              on_progress=on_progress, eager_products=eager)
+        if self.released:
+            return
+        self.catalog = catalog
         self.load_hour(on_progress=on_progress, on_status=on_status)
 
     def hours_with_data(self) -> set[int]:
@@ -166,16 +173,21 @@ class AppState(param.Parameterized):
         care which one ran."""
         decoder = self._decoder_for_instrument()
         local = cc.cache_path_for(remote, self.cache_dir)
-        already_decoded = (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists()
-        if not already_decoded:
-            if on_status:
-                on_status(f"Downloading {remote.filename}...")
-            local = cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
-            if on_status:
-                on_status(f"Processing spectra ({self.instrument})...")
-        zpath = decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
-        if local.exists():
-            local.unlink()
+        # One lock across download + decode + raw-file delete, so a second
+        # session wanting the same hour (server mode shares the cache) waits
+        # and then finds the finished zarr, rather than re-downloading a raw
+        # file the first session is about to delete.
+        with cc.path_lock(decoder._zarr_cache_path(local, self.cache_dir)):
+            already_decoded = (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists()
+            if not already_decoded:
+                if on_status:
+                    on_status(f"Downloading {remote.filename}...")
+                local = cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
+                if on_status:
+                    on_status(f"Processing spectra ({self.instrument})...")
+            zpath = decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
+            if local.exists():
+                local.unlink()
         return zpath
 
     def load_hour(self, on_progress=None, on_status=None):
@@ -187,6 +199,8 @@ class AppState(param.Parameterized):
             self.spectra = None
             return
         zpath = self._ensure_hour_decoded(remote, on_progress=on_progress, on_status=on_status)
+        if self.released:
+            return
         self.spectra = rr.SpectraHour(zpath)
         mid = self.spectra.n_time // 2
         self.selected_time = float(self.spectra.time[mid])
@@ -261,11 +275,27 @@ class AppState(param.Parameterized):
         pending = {(pv.product_id, pv.instrument_id): pv
                    for pv in self.catalog if pv.file_path is None}
         for n, pv in enumerate(pending.values()):
+            if self.released:
+                break
             if on_status:
                 on_status(f"Caching products: {n + 1}/{len(pending)} ({pv.product_id}, "
                           f"{pv.instrument_id})...")
             self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir, on_progress=on_progress)
         return len(pending)
+
+    def release(self) -> None:
+        """Drop everything this session holds in memory (loaded spectra, the
+        catalog, per-panel Bokeh model references). Used when a server-mode
+        session ends or goes idle; the state object itself stays usable as
+        an empty shell, but background loads still in flight are discarded."""
+        self.released = True
+        self.spectra = None
+        self.catalog = []
+        self.available_hours = []
+        self.colorbar_models.clear()
+        self.range_keys.clear()
+        self.auto_bounds.clear()
+        self.panel_log.clear()
 
     def catalog_variable(self, catalog_id: str) -> gp.ProductVariable | None:
         return next((p for p in self.catalog if p.catalog_id == catalog_id), None)
@@ -1189,8 +1219,44 @@ def _spectrum_plot(state: AppState):
     )
 
 
-def build_app() -> pn.template.BaseTemplate:
-    settings = ss.Settings()
+class ActivityBeacon(pn.reactive.ReactiveHTML):
+    """Invisible; reports that the user is at the keyboard/mouse by bumping
+    `pings` at most once every `throttle_ms`. Server-mode idle detection
+    needs this because zooming, panning and hovering are handled entirely in
+    the browser and never reach Python, so server-side events alone would
+    make an actively-used session look idle."""
+
+    pings = param.Integer(default=0)
+    throttle_ms = param.Integer(default=15000)
+
+    _template = '<div id="beacon" style="display:none"></div>'
+
+    _scripts = {
+        "render": """
+            let last = 0;
+            const bump = () => {
+                const now = Date.now();
+                if (now - last < data.throttle_ms) { return; }
+                last = now;
+                data.pings += 1;
+            };
+            for (const name of ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart']) {
+                window.addEventListener(name, bump, {passive: true});
+            }
+        """,
+    }
+
+
+def build_app(server_mode: bool = False,
+              idle_timeout_s: float | None = sm.DEFAULT_IDLE_TIMEOUT_S) -> pn.template.BaseTemplate:
+    """Builds one user session's UI (Panel calls this once per browser
+    session). server_mode=True is for a shared, long-running server: settings
+    are per-session and in memory only (sessions must not share/overwrite one
+    settings.json), "Clean cache" is hidden (the cache is shared, so one
+    user's click would wipe everyone's data), and the session's memory is
+    released after `idle_timeout_s` without user activity, or when the
+    browser goes away."""
+    settings = ss.Settings(path=None if server_mode else ss.DEFAULT_SETTINGS_PATH)
     state = AppState(settings)
 
     try:
@@ -1221,7 +1287,8 @@ def build_app() -> pn.template.BaseTemplate:
     load_btn = pn.widgets.Button(name="Load", button_type="primary", width=80, align="end")
     cache_day_btn = pn.widgets.Button(name="Cache entire day", button_type="success", width=130, align="end")
     reset_all_btn = pn.widgets.Button(name="Reset all settings", button_type="warning", width=140, align="end")
-    clean_cache_btn = pn.widgets.Button(name="Clean cache", button_type="danger", width=100, align="end")
+    clean_cache_btn = pn.widgets.Button(name="Clean cache", button_type="danger", width=100, align="end",
+                                         visible=not server_mode)
     status = pn.pane.Markdown("", sizing_mode="stretch_width")
     download_status = pn.pane.Markdown("", sizing_mode="stretch_width")
 
@@ -1675,13 +1742,58 @@ def build_app() -> pn.template.BaseTemplate:
     # stretch_both, so it's the one that expands to consume whatever
     # vertical space those fixed-height rows don't need -- filling the
     # window instead of leaving empty space below a fixed-height grid.
-    return pn.Column(
+    content = pn.Column(
         top_bar,
         controls_row,
         grid_pane,
         pn.Row(instrument_select, channel_toggle, status, download_status, align="center"),
         sizing_mode="stretch_both",
     )
+    if not server_mode:
+        return content
+    return _wrap_for_server_mode(state, content, idle_timeout_s, stop_playback)
+
+
+def _wrap_for_server_mode(state: AppState, content: pn.Column, idle_timeout_s: float | None,
+                          stop_playback) -> pn.Column:
+    """Adds the per-session idle expiry and cleanup to a built UI.
+
+    Two ways a session ends, both funnelled through one SessionLifecycle:
+    the browser goes away (Bokeh destroys the session -> we free its data),
+    or the tab stays open but nobody uses it for `idle_timeout_s` (we free
+    the data and swap the UI for a notice, since Bokeh would otherwise keep
+    that session forever)."""
+    root = pn.Column(sizing_mode="stretch_both", margin=0)
+
+    def release(expired: bool):
+        if expired:
+            stop_playback()
+            restart = pn.widgets.Button(name="Start a new session", button_type="primary", width=160)
+            restart.on_click(lambda event: setattr(pn.state.location, "reload", True))
+            root[:] = [pn.pane.Markdown(
+                "## Session ended\n\nThis session was released after "
+                f"{idle_timeout_s / 60:g} minutes without activity, to free server memory."),
+                restart]
+        state.release()
+
+    lifecycle = sm.SessionLifecycle(idle_timeout_s, release)
+    beacon = ActivityBeacon(width=0, height=0, margin=0)
+    beacon.param.watch(lambda event: lifecycle.touch(), "pings")
+    root[:] = [beacon, content]
+
+    doc = pn.state.curdoc
+    if doc is not None:
+        doc.on_session_destroyed(lambda session_context: lifecycle.close())
+    if idle_timeout_s:
+        # Check often enough that expiry lands within ~10% of the limit.
+        period_ms = int(min(60_000, max(1_000, idle_timeout_s * 100)))
+
+        def check():
+            if lifecycle.check():
+                cb.stop()
+
+        cb = pn.state.add_periodic_callback(check, period=period_ms)
+    return root
 
 
 if pn.state.served:

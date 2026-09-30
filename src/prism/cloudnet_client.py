@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -192,6 +194,32 @@ def cache_path_for(remote: RemoteFile, cache_dir: Path = DEFAULT_CACHE_DIR) -> P
     return cache_dir / subdir / remote.checksum[:2] / f"{remote.checksum}_{remote.filename}"
 
 
+_path_locks: dict[str, list] = {}  # path -> [RLock, users]
+_path_locks_guard = threading.Lock()
+
+
+@contextmanager
+def path_lock(path: Path):
+    """Serialize work on one cache path across threads (i.e. across user
+    sessions in server mode, which share one cache directory): two sessions
+    asking for the same file must not both write its ".part" file or decode
+    into the same zarr store. Re-entrant, so a caller can hold the lock
+    across a download + decode whose inner steps lock the same path again.
+    Entries are dropped once nobody holds or waits on them."""
+    key = str(path)
+    with _path_locks_guard:
+        entry = _path_locks.setdefault(key, [threading.RLock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _path_locks_guard:
+            entry[1] -= 1
+            if entry[1] == 0:
+                del _path_locks[key]
+
+
 def ensure_downloaded(
     remote: RemoteFile,
     cache_dir: Path = DEFAULT_CACHE_DIR,
@@ -208,7 +236,15 @@ def ensure_downloaded(
     on_progress(filename, downloaded_bytes, total_bytes), if given, is called
     after every chunk -- e.g. to drive a status line -- and once more with
     downloaded_bytes == total_bytes when a cache hit skips the download.
+
+    Thread-safe: concurrent callers for the same file queue on a lock, and
+    the ones that waited find it already downloaded.
     """
+    with path_lock(cache_path_for(remote, cache_dir)):
+        return _download_locked(remote, cache_dir, max_retries, on_progress)
+
+
+def _download_locked(remote, cache_dir, max_retries, on_progress) -> Path:
     dest = cache_path_for(remote, cache_dir)
     if dest.exists() and dest.stat().st_size == remote.size:
         if on_progress:

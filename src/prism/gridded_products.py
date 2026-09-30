@@ -454,6 +454,14 @@ def _load_dataset(path: str) -> xr.Dataset:
     return xr.open_dataset(path)
 
 
+def clear_dataset_cache() -> None:
+    """Drop every cached dataset (see _load_dataset). Their open file handles
+    and loaded arrays otherwise live as long as the process, which a
+    long-running server can't afford once nobody is using them; xarray closes
+    the files when the dropped datasets are garbage-collected."""
+    _load_dataset.cache_clear()
+
+
 def load_curtain(pv: ProductVariable, t_start=None, t_stop=None):
     """Return (time[datetime64], height[m] or None, values) sliced to an
     optional time window (e.g. the currently selected hour). height is None

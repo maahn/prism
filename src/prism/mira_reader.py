@@ -31,6 +31,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from prism import cloudnet_client as cc
 from prism import rpg_reader as rr
 from prism.rpg_reader import MASK_CODE, _encode_db
 
@@ -122,6 +123,14 @@ def _zarr_cache_path(znc_gz_path: Path, cache_dir: Path) -> Path:
 
 
 def ensure_decoded(znc_gz_path: Path, cache_dir: Path, on_status=None) -> Path:
+    """Thread-safe wrapper: concurrent callers (user sessions in server mode)
+    decoding the same file queue on a lock instead of writing one store
+    twice. See _ensure_decoded_locked for the actual work."""
+    with cc.path_lock(_zarr_cache_path(znc_gz_path, cache_dir)):
+        return _ensure_decoded_locked(znc_gz_path, cache_dir, on_status)
+
+
+def _ensure_decoded_locked(znc_gz_path: Path, cache_dir: Path, on_status=None) -> Path:
     """Decode a gzip-compressed MIRA znc file into a chunked zarr store, if
     not already cached. on_status is accepted (but unused) only so callers
     can invoke rpg_reader's and mira_reader's ensure_decoded through the

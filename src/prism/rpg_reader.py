@@ -25,6 +25,8 @@ import rpgpy
 import rpgpy.header
 import zarr
 
+from prism import cloudnet_client as cc
+
 # RPG instrument software timestamps are seconds since 2001-01-01T00:00:00Z,
 # not the Unix epoch. Convert once at decode time so everything downstream
 # (moments, other Cloudnet products) can compare on plain Unix seconds.
@@ -303,7 +305,14 @@ def _repair_truncated_tail(lv0_path: Path, header: dict) -> tuple[Path, int, int
 
 
 def ensure_decoded(lv0_path: Path, cache_dir: Path, on_status: Callable[[str], None] | None = None) -> Path:
-    """Decode an LV0 file into a chunked zarr store, if not already cached."""
+    """Decode an LV0 file into a chunked zarr store, if not already cached.
+    Thread-safe: concurrent callers (user sessions in server mode) decoding
+    the same file queue on a lock instead of writing one store twice."""
+    with cc.path_lock(_zarr_cache_path(lv0_path, cache_dir)):
+        return _ensure_decoded_locked(lv0_path, cache_dir, on_status)
+
+
+def _ensure_decoded_locked(lv0_path: Path, cache_dir: Path, on_status: Callable[[str], None] | None) -> Path:
     out = _zarr_cache_path(lv0_path, cache_dir)
     done_marker = out / "_SUCCESS"
     if done_marker.exists():
