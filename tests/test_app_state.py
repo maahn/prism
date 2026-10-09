@@ -110,7 +110,7 @@ def test_resolve_variable_downloads_a_stub_exactly_once(settings, tmp_path, monk
     resolved = _pv("radar:Zh#rpg-fmcw-94", file_path=tmp_path / "resolved.nc")
     calls = []
 
-    def fake_resolve_product(pv, catalog, cache_dir, on_progress=None):
+    def fake_resolve_product(pv, catalog, cache_dir, on_progress=None, **_):
         calls.append(pv.catalog_id)
         return [resolved if p.catalog_id == pv.catalog_id else p for p in catalog]
 

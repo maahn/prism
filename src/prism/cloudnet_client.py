@@ -20,6 +20,10 @@ API_BASE = "https://cloudnet.fmi.fi/api"
 DEFAULT_CACHE_DIR = Path(os.environ.get(
     "PRISM_CACHE", Path.home() / ".cache" / "prism"
 ))
+# Under DEFAULT_CACHE_DIR (or a configured `cache_dir`) every site gets its own
+# tree, `<cache_dir>/sites/<site>/`, so "Clean cache" can delete exactly the
+# part PRISM owns without touching anything else in a user-chosen directory.
+SITES_SUBDIR = "sites"
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,8 @@ class RemoteFile:
     instrument_id: str | None
     kind: str  # "raw" or "product"
     product_id: str | None = None
+    site: str | None = None
+    day: date | None = None
 
 
 def _get(path: str, **params) -> list[dict]:
@@ -141,6 +147,8 @@ def list_raw_spectra_files(site: str, day: date, instrument: str = "rpg-fmcw-94"
             download_url=f["downloadUrl"],
             instrument_id=f.get("instrument", {}).get("instrumentId"),
             kind="raw",
+            site=site,
+            day=day,
         )
         for f in data
         if _is_raw_spectra_file(instrument, f["filename"])
@@ -162,6 +170,8 @@ def list_product_files(site: str, day: date) -> list[RemoteFile]:
             instrument_id=(f.get("instrument") or {}).get("instrumentId"),
             kind="product",
             product_id=f["product"]["id"],
+            site=site,
+            day=day,
         )
         for f in data
     ]
@@ -184,14 +194,121 @@ def list_model_files(site: str, day: date) -> list[RemoteFile]:
             instrument_id=f["model"]["id"],
             kind="product",
             product_id="model",
+            site=site,
+            day=day,
         )
         for f in data
     ]
 
 
+PATH_PATTERN_TAIL = "/{product}/{year}/{file}"
+
+
+def check_path_pattern(pattern) -> None:
+    """Raise ValueError unless `pattern` is a data-path pattern: a string
+    ending in "/{product}/{year}/{file}" whose prefix uses only {site} and
+    {site_flat}."""
+    if not isinstance(pattern, str) or not pattern.endswith(PATH_PATTERN_TAIL):
+        raise ValueError(f"path pattern must be a string ending in '{PATH_PATTERN_TAIL}', got {pattern!r}")
+    try:
+        pattern[: -len(PATH_PATTERN_TAIL)].format(site="s", site_flat="s")
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(f"path pattern {pattern!r}: only {{site}} and {{site_flat}} may appear "
+                         f"before '{PATH_PATTERN_TAIL}' ({exc})") from exc
+
+
+def site_cache_dir(site: str, cache_dir: Path | None = None,
+                   site_dirs: dict[str, str] | None = None,
+                   path_pattern: str | None = None) -> Path:
+    """Root directory holding everything cached for one site. Taken from, by
+    priority:
+
+    1. `site_dirs[site]`, a path pattern for that one site;
+    2. `path_pattern`, the pattern for all other sites.
+
+    Both look like "/data/{site_flat}/cloudnet/{product}/{year}/{file}": they
+    must end in "/{product}/{year}/{file}" (how files are laid out below the
+    site root); everything before that is the root, with `{site}` (the
+    Cloudnet id, "ny-alesund") and `{site_flat}` (hyphens and underscores
+    removed, "nyalesund") substituted. New sites need no config change.
+    3. Neither given: `<cache_dir>/sites/<site>` (default ~/.cache/prism)."""
+    pattern = (site_dirs or {}).get(site) or path_pattern
+    if pattern:
+        root = pattern[: -len(PATH_PATTERN_TAIL)]
+        flat = site.replace("-", "").replace("_", "")
+        return Path(root.format(site=site, site_flat=flat)).expanduser()
+    base = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+    return base.expanduser() / SITES_SUBDIR / site
+
+
+_FILENAME_PREFIX = re.compile(r"^\d{8}_[^_]+_(?P<rest>.+?)\.nc$")
+_INSTRUMENT_PID_SUFFIX = re.compile(r"_[0-9a-f]{8}$")
+
+
+def product_dir_name(remote: RemoteFile) -> str:
+    """Folder (below the site root) a product file lives in. Taken from the
+    Cloudnet filename (`20240101_<site>_<this>[_<pid>].nc`), which is what
+    the existing archives are organised by: `categorize`, `classification`,
+    `rpg-fmcw-94`, `hatpro-multi`, `weather-station`, `ecmwf`, ..."""
+    m = _FILENAME_PREFIX.match(remote.filename)
+    if m:
+        return _INSTRUMENT_PID_SUFFIX.sub("", m.group("rest"))
+    return remote.instrument_id or remote.product_id or "other"
+
+
+def _year_of(remote: RemoteFile) -> str:
+    """Every product/raw group is stored in per-year folders, whatever the
+    existing archive does (some of its folders are flat)."""
+    if remote.day is not None:
+        return f"{remote.day.year:04d}"
+    if re.match(r"\d{8}", remote.filename):
+        return remote.filename[:4]
+    return "unknown"
+
+
 def cache_path_for(remote: RemoteFile, cache_dir: Path = DEFAULT_CACHE_DIR) -> Path:
-    subdir = "raw" if remote.kind == "raw" else "products"
-    return cache_dir / subdir / remote.checksum[:2] / f"{remote.checksum}_{remote.filename}"
+    """Where `remote` is stored below a site root (see site_cache_dir):
+    products at `<product>/<YYYY>/<filename>`, raw files at
+    `raw/<instrument>/<YYYY>/<filename>`. Names are the plain Cloudnet
+    filenames (no checksum prefix) so the tree is browsable and shareable;
+    a download is considered valid when its size matches the portal's."""
+    if remote.kind == "raw":
+        return cache_dir / "raw" / (remote.instrument_id or "unknown") / _year_of(remote) / remote.filename
+    return cache_dir / product_dir_name(remote) / _year_of(remote) / remote.filename
+
+
+def find_existing(remote: RemoteFile, cache_dir: Path, any_size: bool = False) -> Path | None:
+    """A complete copy of a product file that already sits somewhere in the
+    site root, in whatever layout the archive uses: `<dir>/<file>` (flat) or
+    `<dir>/<YYYY>/<file>`, under any folder name (so hand-named folders such
+    as `turbulence` or `mwr_single_pointing` are found too). Only stat calls,
+    no directory listings of the (large) data folders. A copy only counts if
+    its size matches the portal's, unless `any_size` (keep_existing mode)."""
+    if remote.kind != "product" or not cache_dir.is_dir():
+        return None
+    year = _year_of(remote)
+    try:
+        subdirs = [d for d in cache_dir.iterdir() if d.is_dir()]
+    except OSError:
+        return None
+    for d in subdirs:
+        for candidate in (d / year / remote.filename, d / remote.filename):
+            try:
+                if candidate.is_file() and (any_size or candidate.stat().st_size == remote.size):
+                    return candidate
+            except OSError:
+                continue
+    return None
+
+
+def zarr_path_for(local_path: Path, cache_dir: Path, name: str) -> Path:
+    """Decoded-spectra store for a raw file: `spectra_zarr/<instrument>/<YYYY>/<name>.zarr`,
+    mirroring the raw file's own `raw/<instrument>/<YYYY>/` folder."""
+    try:
+        rel_dir = local_path.parent.relative_to(cache_dir / "raw")
+    except ValueError:
+        rel_dir = Path()
+    return cache_dir / "spectra_zarr" / rel_dir / f"{name}.zarr"
 
 
 _path_locks: dict[str, list] = {}  # path -> [RLock, users]
@@ -225,6 +342,7 @@ def ensure_downloaded(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     max_retries: int = 5,
     on_progress: Callable[[str, int, int], None] | None = None,
+    keep_existing: bool = False,
 ) -> Path:
     """Download a file into the local cache unless already present and valid.
 
@@ -237,19 +355,29 @@ def ensure_downloaded(
     after every chunk -- e.g. to drive a status line -- and once more with
     downloaded_bytes == total_bytes when a cache hit skips the download.
 
+    keep_existing: use a file that is already in place even if its size
+    differs from the portal's (e.g. an older processing version) instead of
+    replacing it. For configured data archives, whose files are never
+    overwritten.
+
     Thread-safe: concurrent callers for the same file queue on a lock, and
     the ones that waited find it already downloaded.
     """
     with path_lock(cache_path_for(remote, cache_dir)):
-        return _download_locked(remote, cache_dir, max_retries, on_progress)
+        return _download_locked(remote, cache_dir, max_retries, on_progress, keep_existing)
 
 
-def _download_locked(remote, cache_dir, max_retries, on_progress) -> Path:
+def _download_locked(remote, cache_dir, max_retries, on_progress, keep_existing=False) -> Path:
     dest = cache_path_for(remote, cache_dir)
-    if dest.exists() and dest.stat().st_size == remote.size:
+    if dest.is_file() and (keep_existing or dest.stat().st_size == remote.size):
         if on_progress:
             on_progress(remote.filename, remote.size, remote.size)
         return dest
+    existing_copy = find_existing(remote, cache_dir, any_size=keep_existing)
+    if existing_copy is not None:
+        if on_progress:
+            on_progress(remote.filename, remote.size, remote.size)
+        return existing_copy
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
 
@@ -294,10 +422,11 @@ def _download_locked(remote, cache_dir, max_retries, on_progress) -> Path:
 
 
 def cache_size_bytes(cache_dir: Path = DEFAULT_CACHE_DIR) -> int:
-    """Total size of downloaded/decoded data on disk (raw LV0 + decoded zarr
-    + product netCDFs), for a "cache: N GB" status display."""
+    """Total size of everything PRISM cached under `cache_dir`, for a
+    "cache: N GB" status display. Never used on a configured data archive
+    (it could be terabytes, and isn't PRISM's to measure)."""
     total = 0
-    for sub in ("raw", "products", "spectra_zarr"):
+    for sub in (SITES_SUBDIR, "raw", "products", "spectra_zarr"):  # the last three: pre-per-site layout
         root = cache_dir / sub
         if not root.exists():
             continue
@@ -318,9 +447,10 @@ def format_bytes(n: int) -> str:
 
 def clear_data_cache(cache_dir: Path = DEFAULT_CACHE_DIR) -> None:
     """Delete downloaded/decoded data (raw LV0, decoded zarr, product netCDFs)
-    but leave user settings (stored separately) untouched."""
+    but leave user settings (stored separately) untouched. Only for the
+    default cache; a configured data archive is never cleaned."""
     import shutil
-    for sub in ("raw", "products", "spectra_zarr"):
+    for sub in (SITES_SUBDIR, "raw", "products", "spectra_zarr"):
         shutil.rmtree(cache_dir / sub, ignore_errors=True)
 
 

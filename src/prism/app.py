@@ -88,8 +88,6 @@ class AppState(param.Parameterized):
     def __init__(self, settings: ss.Settings, **params):
         super().__init__(**params)
         self.settings = settings
-        cache_dir = settings.get("cache_dir")
-        self.cache_dir = Path(cache_dir) if cache_dir else cc.DEFAULT_CACHE_DIR
         self.available_hours: list[cc.RemoteFile] = []
         self.catalog: list[gp.ProductVariable] = []
         self.spectra: rr.SpectraHour | None = None
@@ -119,6 +117,27 @@ class AppState(param.Parameterized):
         # Older settings.json files predate the instrument selector.
         self.instrument = last.get("instrument", "rpg-fmcw-94")
 
+    @property
+    def cache_dir(self) -> Path:
+        """Root of everything cached for the CURRENT site: a configured
+        data directory (settings `site_dirs`/`path_pattern`/`cache_dir`) or
+        ~/.cache/prism/sites/<site>. Switching site switches the root."""
+        return cc.site_cache_dir(self.site, self.settings.get("cache_dir"),
+                                 self.settings.get("site_dirs"), self.settings.get("path_pattern"))
+
+    @property
+    def keep_existing(self) -> bool:
+        """Config option: use product files already on disk as they are,
+        even if the portal now publishes a different version. Default off,
+        i.e. a file whose size differs from the portal's is re-downloaded."""
+        return bool(self.settings.get("keep_existing"))
+
+    @property
+    def cache_root(self) -> Path:
+        """Directory the "Cache: N GB" label measures and "Clean cache"
+        empties (the default cache only; see Settings.data_dirs_configured)."""
+        return Path(self.settings.get("cache_dir") or cc.DEFAULT_CACHE_DIR).expanduser()
+
     def refresh_site_day(self, on_progress=None, on_status=None):
         """Day-scoped: raw spectra file listing + moments/curtain-variable
         discovery. Cloudnet only publishes these as whole-day files, so this
@@ -141,7 +160,8 @@ class AppState(param.Parameterized):
             if stored_id and ":" in stored_id:
                 eager.add(stored_id.split(":", 1)[0])
         catalog = gp.discover(self.site, self.day, self.cache_dir,
-                              on_progress=on_progress, eager_products=eager)
+                              on_progress=on_progress, eager_products=eager,
+                              keep_existing=self.keep_existing)
         if self.released:
             return
         self.catalog = catalog
@@ -280,7 +300,8 @@ class AppState(param.Parameterized):
             if on_status:
                 on_status(f"Caching products: {n + 1}/{len(pending)} ({pv.product_id}, "
                           f"{pv.instrument_id})...")
-            self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir, on_progress=on_progress)
+            self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir, on_progress=on_progress,
+                                              keep_existing=self.keep_existing)
         return len(pending)
 
     def release(self) -> None:
@@ -311,7 +332,7 @@ class AppState(param.Parameterized):
         pv = self.catalog_variable(catalog_id)
         if pv is None or pv.file_path is not None:
             return pv
-        self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir)
+        self.catalog = gp.resolve_product(pv, self.catalog, self.cache_dir, keep_existing=self.keep_existing)
         return self.catalog_variable(catalog_id)
 
     @property
@@ -1248,15 +1269,19 @@ class ActivityBeacon(pn.reactive.ReactiveHTML):
 
 
 def build_app(server_mode: bool = False,
-              idle_timeout_s: float | None = sm.DEFAULT_IDLE_TIMEOUT_S) -> pn.template.BaseTemplate:
+              idle_timeout_s: float | None = sm.DEFAULT_IDLE_TIMEOUT_S,
+              config: dict | None = None) -> pn.template.BaseTemplate:
     """Builds one user session's UI (Panel calls this once per browser
     session). server_mode=True is for a shared, long-running server: settings
     are per-session and in memory only (sessions must not share/overwrite one
     settings.json), "Clean cache" is hidden (the cache is shared, so one
     user's click would wipe everyone's data), and the session's memory is
     released after `idle_timeout_s` without user activity, or when the
-    browser goes away."""
-    settings = ss.Settings(path=None if server_mode else ss.DEFAULT_SETTINGS_PATH)
+    browser goes away. `config` (see settings_store.load_config) points sites
+    at shared data directories; it overrides the settings file and, like any
+    explicitly chosen data directory, hides the cache-size label and
+    "Clean cache"."""
+    settings = ss.Settings(path=None if server_mode else ss.DEFAULT_SETTINGS_PATH, overrides=config)
     state = AppState(settings)
 
     try:
@@ -1288,7 +1313,7 @@ def build_app(server_mode: bool = False,
     cache_day_btn = pn.widgets.Button(name="Cache entire day", button_type="success", width=130, align="end")
     reset_all_btn = pn.widgets.Button(name="Reset all settings", button_type="warning", width=140, align="end")
     clean_cache_btn = pn.widgets.Button(name="Clean cache", button_type="danger", width=100, align="end",
-                                         visible=not server_mode)
+                                         visible=not (server_mode or settings.data_dirs_configured))
     status = pn.pane.Markdown("", sizing_mode="stretch_width")
     download_status = pn.pane.Markdown("", sizing_mode="stretch_width")
 
@@ -1362,8 +1387,13 @@ def build_app(server_mode: bool = False,
         _push(lambda: setattr(status, "object", text))
 
     def show_cache_size():
-        size = cc.cache_size_bytes(state.cache_dir)
-        download_status.object = f"Cache: {cc.format_bytes(size)} at `{state.cache_dir}`"
+        if settings.data_dirs_configured:
+            # A configured directory is a shared data archive: never walk
+            # (potentially terabytes of) it, just say where data goes.
+            download_status.object = f"Data directory: `{state.cache_dir}`"
+            return
+        size = cc.cache_size_bytes(state.cache_root)
+        download_status.object = f"Cache: {cc.format_bytes(size)} at `{state.cache_root}`"
 
     def set_controls_disabled(disabled: bool):
         for w in (load_btn, cache_day_btn, hour_select, prev_btn, next_btn,
@@ -1548,7 +1578,7 @@ def build_app(server_mode: bool = False,
 
     def do_clean_cache(event):
         status.object = "Clearing cache..."
-        cc.clear_data_cache(state.cache_dir)
+        cc.clear_data_cache(state.cache_root)
         status.object = "Cache cleared. Click Load to re-download."
         show_cache_size()
 

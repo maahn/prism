@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 import panel as pn
 
 from prism import server_mode as sm
+from prism import settings_store as ss
 from prism.app import build_app
 
 SERVER_DEFAULT_PORT = 5006
@@ -18,6 +20,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=0,
                         help="port to serve on (0 = pick automatically; 5006 with --server)")
     parser.add_argument("--no-browser", action="store_true", help="don't auto-open a browser tab")
+    parser.add_argument("--config", default=os.environ.get("PRISM_CONFIG"), metavar="FILE",
+                        help="JSON file pointing sites at shared data directories "
+                             '({"site_dirs": {"hyytiala": "/data/hyytiala/cloudnet"}}); '
+                             "also PRISM_CONFIG. Disables the cache-size label and 'Clean cache'")
     server = parser.add_argument_group(
         "server mode", "serve many users at once, each with an independent session")
     server.add_argument("--server", action="store_true",
@@ -34,6 +40,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="release a session's memory after this many minutes without user activity "
                              "(default: %(default)g; 0 = never)")
     args = parser.parse_args(argv)
+    args.config_data = None
+    if args.config:
+        try:
+            args.config_data = ss.load_config(args.config)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.idle_timeout < 0:
         parser.error("--idle-timeout must be >= 0")
     return args
@@ -42,9 +54,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.server:
-        pn.serve(build_app, port=args.port, show=not args.no_browser, title="PRISM")
+        def build_local_session():
+            return build_app(config=args.config_data)
+
+        pn.serve(build_local_session, port=args.port, show=not args.no_browser, title="PRISM")
         return
 
+    # Files written into a shared data directory must stay writable by the
+    # other users of its group.
+    os.umask(0o002)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     port = args.port or SERVER_DEFAULT_PORT
     if not args.allow_websocket_origin:
@@ -55,7 +73,8 @@ def main(argv: list[str] | None = None) -> None:
     # A plain function, not functools.partial: Panel only treats real
     # functions as per-session app factories.
     def build_session():
-        return build_app(server_mode=True, idle_timeout_s=args.idle_timeout * 60)
+        return build_app(server_mode=True, idle_timeout_s=args.idle_timeout * 60,
+                         config=args.config_data)
 
     pn.serve(
         build_session,

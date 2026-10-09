@@ -119,7 +119,7 @@ def _zarr_cache_path(znc_gz_path: Path, cache_dir: Path) -> Path:
     for suffix in (".gz", ".znc"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
-    return cache_dir / "spectra_zarr" / f"{name}.zarr"
+    return cc.zarr_path_for(znc_gz_path, cache_dir, name)
 
 
 def ensure_decoded(znc_gz_path: Path, cache_dir: Path, on_status=None) -> Path:

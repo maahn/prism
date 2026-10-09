@@ -271,7 +271,7 @@ class ProductVariable:
 
 def discover(
     site: str, day: date, cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_progress=None,
-    eager_products: set[str] = DEFAULT_EAGER_PRODUCTS,
+    eager_products: set[str] = DEFAULT_EAGER_PRODUCTS, keep_existing: bool = False,
 ) -> list[ProductVariable]:
     """List every curtain (time-height) and time-only variable available for
     this site/day.
@@ -293,7 +293,8 @@ def discover(
     catalog: list[ProductVariable] = []
     for remote in remotes:
         if remote.product_id in eager_products:
-            catalog.extend(_scan_remote(remote, cache_dir, on_progress=on_progress))
+            catalog.extend(_scan_remote(remote, cache_dir, on_progress=on_progress,
+                                        keep_existing=keep_existing))
         else:
             catalog.extend(_stub_remote(remote))
     catalog = _disambiguate_labels(catalog)
@@ -305,7 +306,8 @@ def discover(
 
 
 def resolve_product(pv: ProductVariable, catalog: list[ProductVariable],
-                     cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_progress=None) -> list[ProductVariable]:
+                     cache_dir: Path = cc.DEFAULT_CACHE_DIR, on_progress=None,
+                     keep_existing: bool = False) -> list[ProductVariable]:
     """Download and scan the one product `pv` belongs to (a no-op if it's
     already real), replacing every stub entry for that (product, instrument)
     pair in `catalog` with the real thing -- called the first time the user
@@ -314,7 +316,7 @@ def resolve_product(pv: ProductVariable, catalog: list[ProductVariable],
     only ever mean "not offered until picked", never wrong data."""
     if pv.file_path is not None or pv.remote is None:
         return catalog
-    fresh = _scan_remote(pv.remote, cache_dir, on_progress=on_progress)
+    fresh = _scan_remote(pv.remote, cache_dir, on_progress=on_progress, keep_existing=keep_existing)
     kept = [p for p in catalog
             if not (p.product_id == pv.product_id and p.instrument_id == pv.instrument_id)]
     return _disambiguate_labels(kept + fresh)
@@ -344,11 +346,12 @@ def _catalog_id_for(product_id: str, var_name: str, instrument: str) -> str:
     return f"{product_id}:{var_name}#{instrument}"
 
 
-def _scan_remote(remote: cc.RemoteFile, cache_dir: Path, on_progress=None) -> list[ProductVariable]:
+def _scan_remote(remote: cc.RemoteFile, cache_dir: Path, on_progress=None,
+                 keep_existing: bool = False) -> list[ProductVariable]:
     """Download (if needed), open, and scan one product file into real
     ProductVariable entries."""
     try:
-        path = cc.ensure_downloaded(remote, cache_dir, on_progress=on_progress)
+        path = cc.ensure_downloaded(remote, cache_dir, on_progress=on_progress, keep_existing=keep_existing)
         ds = xr.open_dataset(path)
     except Exception:
         # A single flaky/oversized download (or a file that fails to parse)

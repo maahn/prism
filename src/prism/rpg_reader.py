@@ -135,7 +135,7 @@ class ChirpTable:
 
 
 def _zarr_cache_path(lv0_path: Path, cache_dir: Path) -> Path:
-    return cache_dir / "spectra_zarr" / f"{lv0_path.stem}.zarr"
+    return cc.zarr_path_for(lv0_path, cache_dir, lv0_path.stem)
 
 
 def _n_points_per_level(header: dict) -> np.ndarray:

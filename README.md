@@ -97,7 +97,7 @@ What differs from the default local mode:
   only. `~/.config/prism/settings.json` is neither read nor written, so users
   can't overwrite each other's settings.
 - **Shared data cache.** All sessions use one download/decode cache
-  (`~/.cache/prism`, or `PRISM_CACHE`), so a file one user has loaded is
+  (`~/.cache/prism`, or `PRISM_CACHE`; see "Shared data directories" to use an existing archive), so a file one user has loaded is
   instant for the next. Concurrent requests for the same file wait for a
   single download/decode instead of racing. Because the cache is shared, the
   **Clean cache** button is hidden (one user's click would delete data other
@@ -118,6 +118,68 @@ There is no authentication. Put PRISM behind a reverse proxy or firewall if
 the server is reachable from anywhere you don't trust. Running it under
 `systemd` or in a container works like any other long-running Python
 process.
+
+## Shared data directories
+
+By default PRISM caches under `~/.cache/prism/sites/<site>/`. To use an
+existing data archive instead (for example one shared by a research group),
+point sites at it with a JSON config file:
+
+```json
+{
+  "site_dirs": {
+    "hyytiala": "/projekt1/ag_maahn/data_obs_nobackup/hyytiala/cloudnet/{product}/{year}/{file}",
+    "ny-alesund": "/projekt1/ag_maahn/data_obs_nobackup/nyaalesund/cloudnet/{product}/{year}/{file}"
+  }
+}
+```
+
+```bash
+prism --server --config prism-config.json     # or: PRISM_CONFIG=prism-config.json
+```
+
+Or, so that new sites need no config change, give a path pattern:
+
+```json
+{
+  "path_pattern": "/projekt1/ag_maahn/data_obs_nobackup/{site_flat}/cloudnet/{product}/{year}/{file}",
+  "site_dirs": {"ny-alesund": "/projekt1/ag_maahn/data_obs_nobackup/nyaalesund/cloudnet/{product}/{year}/{file}"}
+}
+```
+
+The pattern must end in `/{product}/{year}/{file}`; before that, `{site}`
+(Cloudnet id, e.g. `ny-alesund`) and `{site_flat}` (hyphens/underscores
+removed, e.g. `nyalesund`) are substituted. `site_dirs` (site id -> a pattern of the same form) overrides it
+for sites whose folder doesn't follow it (above, Ny-Ålesund's folder has a
+double "a"). Without either, `cache_dir` (default `~/.cache/prism`) is used as
+`<cache_dir>/sites/<site>`. All keys also work in
+`~/.config/prism/settings.json`; `--config` wins over it. Add
+`"keep_existing": true` to never replace files already on disk.
+
+Layout below each site directory (the same as Cloudnet downloads are
+usually organised in):
+
+```
+<site dir>/categorize/2024/20240216_hyytiala_categorize.nc
+<site dir>/rpg-fmcw-94/2024/20240216_hyytiala_rpg-fmcw-94_19156417.nc
+<site dir>/raw/<instrument>/<YYYY>/...        # raw spectra, deleted once decoded
+<site dir>/spectra_zarr/<instrument>/<YYYY>/  # decoded spectra
+```
+
+- **Folder per product, year folders inside.** The folder is the product part of
+  the Cloudnet filename. New files are always written into `<YYYY>/`.
+- **Existing files are found wherever they are:** flat (`<product>/<file>`),
+  yearly, or in a hand-named folder (`turbulence/`, `mwr_single_pointing/`),
+  matched by filename and size. `scripts/yearly_folders.py` moves flat
+  folders into year folders (dry run by default).
+- **Outdated files are replaced by default.** A product file whose size
+  differs from the portal's (a newer processing version) is downloaded again
+  over the old one. Set `"keep_existing": true` in the config to use files
+  already on disk as they are and only add missing ones.
+- **No cache-size label, no Clean cache.** The directory is not PRISM's to
+  measure or delete; the status line just shows the data directory.
+- In `--server` mode the umask is set to `002`, so new files stay writable
+  for the group.
 
 ## Usage
 
