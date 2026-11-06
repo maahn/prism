@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import secrets
+from pathlib import Path
 
 import panel as pn
 
@@ -15,6 +16,7 @@ from prism.app import build_app
 
 SERVER_DEFAULT_PORT = 5006
 PASSWORD_ENV = "PRISM_PASSWORD"
+LOGIN_TEMPLATE = Path(__file__).parent / "assets" / "login.html"
 
 
 def resolve_password(password_file: str | None, environ=os.environ) -> str | None:
@@ -40,10 +42,12 @@ def auth_options(password: str | None) -> dict:
     Panel's basic_auth takes the password itself rather than a file path --
     a string that happens to name an existing file would be read as a JSON
     user table -- and any username is accepted. The cookie secret is random
-    per start, so everyone has to log in again after a restart."""
+    per start, so everyone has to log in again after a restart. The login
+    page is PRISM's own (assets/login.html): it asks for the password only."""
     if not password:
         return {}
-    return {"basic_auth": password, "cookie_secret": secrets.token_hex(32)}
+    return {"basic_auth": password, "cookie_secret": secrets.token_hex(32),
+            "basic_login_template": str(LOGIN_TEMPLATE)}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

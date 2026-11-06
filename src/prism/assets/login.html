@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<!-- Login page for `prism --password-file`; a Jinja template rendered by Panel
+     (variables: login_endpoint, errormessage). Self-contained on purpose: it is
+     served before anyone is logged in, and nothing is loaded from a CDN.
+     The logo is a copy of logo.svg (a test checks they match). -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PRISM | Login</title>
+  <link rel="icon" href="data:,">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body { font-family: 'Helvetica Neue', Arial, sans-serif; line-height: 1.5; color: #1f2d3d; }
+    .wrap { display: flex; align-items: center; justify-content: center; min-height: 100%; background: #f3f5f8; }
+    form { width: 340px; max-width: calc(100% - 32px); padding: 1.6em 2em 2em; background: #fff;
+           border: 1px solid #dde3ea; border-radius: 10px; box-shadow: 0 2px 10px #0000000d; }
+    .logo { width: 230px; max-width: 100%; margin: 0 auto 0.4em; display: block; }
+    .logo svg { width: 100%; height: auto; display: block; }
+    p.lead { text-align: center; color: #5b6b7d; margin-bottom: 1.1em; }
+    input[type=password] { width: 100%; padding: 12px; font-size: 1em; background: #fafbfc;
+                           border: 1px solid #cfd8e3; border-radius: 6px; }
+    input[type=password]:focus { outline: 2px solid #1f4e8c55; border-color: #1f4e8c; }
+    button { width: 100%; margin-top: 1em; padding: 11px; font-size: 1em; letter-spacing: .08em;
+             text-transform: uppercase; color: #fff; background: #1f4e8c; border: 0; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #173d70; }
+    .error { min-height: 1.5em; margin-bottom: .5em; text-align: center; color: #c62828; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <form action=".{{ login_endpoint }}" method="post">
+      <div class="logo">
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 200' role='img' aria-label='PRISM'>
+<path d='M 40,122 L 40,115.9 L 42,116.2 L 44,117.1 L 46,115.9 L 48,116.0 L 50,116.2 L 52,115.2 L 54,116.0 L 56,116.3 L 58,116.8 L 60,114.9 L 62,115.5 L 64,114.9 L 66,116.7 L 68,116.4 L 70,114.6 L 72,117.0 L 74,116.7 L 76,115.7 L 78,115.3 L 80,113.7 L 82,112.7 L 84,113.0 L 86,110.8 L 88,109.5 L 90,107.6 L 92,104.8 L 94,102.1 L 96,98.3 L 98,93.8 L 100,88.6 L 102,82.9 L 104,76.7 L 106,70.1 L 108,63.4 L 110,56.8 L 112,50.6 L 114,45.1 L 116,40.4 L 118,36.9 L 120,34.7 L 122,34.0 L 124,34.7 L 126,36.9 L 128,40.4 L 130,45.1 L 132,50.6 L 134,56.8 L 136,63.4 L 138,70.1 L 140,76.7 L 142,82.9 L 144,88.6 L 146,93.8 L 148,98.3 L 150,102.1 L 152,104.9 L 154,108.1 L 156,110.5 L 158,111.2 L 160,112.0 L 162,113.4 L 164,115.6 L 166,115.6 L 168,114.4 L 170,114.9 L 172,114.7 L 174,114.7 L 176,116.7 L 178,115.1 L 180,116.1 L 182,115.8 L 184,115.2 L 186,116.6 L 188,115.0 L 190,116.4 L 192,115.0 L 194,115.8 L 196,115.3 L 198,115.4 L 200,117.2 L 202,116.8 L 204,115.5 L 204,122 Z' fill='#e6eef8'/>
+<line x1='12' y1='91.8' x2='103' y2='79.8' stroke='#8a94a3' stroke-width='5' stroke-linecap='round'/>
+<path d='M 40,115.9 L 42,116.2 L 44,117.1 L 46,115.9 L 48,116.0 L 50,116.2 L 52,115.2 L 54,116.0 L 56,116.3 L 58,116.8 L 60,114.9 L 62,115.5 L 64,114.9 L 66,116.7 L 68,116.4 L 70,114.6 L 72,117.0 L 74,116.7 L 76,115.7 L 78,115.3 L 80,113.7 L 82,112.7 L 84,113.0 L 86,110.8 L 88,109.5 L 90,107.6 L 92,104.8 L 94,102.1 L 96,98.3 L 98,93.8 L 100,88.6 L 102,82.9 L 104,76.7 L 106,70.1 L 108,63.4 L 110,56.8 L 112,50.6 L 114,45.1 L 116,40.4 L 118,36.9 L 120,34.7 L 122,34.0 L 124,34.7 L 126,36.9 L 128,40.4 L 130,45.1 L 132,50.6 L 134,56.8 L 136,63.4 L 138,70.1 L 140,76.7 L 142,82.9 L 144,88.6 L 146,93.8 L 148,98.3 L 150,102.1 L 152,104.9 L 154,108.1 L 156,110.5 L 158,111.2 L 160,112.0 L 162,113.4 L 164,115.6 L 166,115.6 L 168,114.4 L 170,114.9 L 172,114.7 L 174,114.7 L 176,116.7 L 178,115.1 L 180,116.1 L 182,115.8 L 184,115.2 L 186,116.6 L 188,115.0 L 190,116.4 L 192,115.0 L 194,115.8 L 196,115.3 L 198,115.4 L 200,117.2 L 202,116.8 L 204,115.5' fill='none' stroke='#1f4e8c' stroke-width='4.5' stroke-linejoin='round' stroke-linecap='round'/>
+<line x1='141' y1='76.8' x2='222' y2='44' stroke='#e8403a' stroke-width='5' stroke-linecap='round'/><line x1='141' y1='79.2' x2='222' y2='57' stroke='#f58a2f' stroke-width='5' stroke-linecap='round'/><line x1='141' y1='81.6' x2='222' y2='70' stroke='#f7d330' stroke-width='5' stroke-linecap='round'/><line x1='141' y1='84.0' x2='222' y2='83' stroke='#4fb760' stroke-width='5' stroke-linecap='round'/><line x1='141' y1='86.4' x2='222' y2='96' stroke='#2f8fd8' stroke-width='5' stroke-linecap='round'/><line x1='141' y1='88.8' x2='222' y2='109' stroke='#6a4fc4' stroke-width='5' stroke-linecap='round'/>
+<text x='120' y='176' text-anchor='middle' font-size='30' fill='#1f4e8c' font-family='Helvetica Neue, Arial, sans-serif' font-weight='700' letter-spacing='6'>PRISM</text>
+</svg>
+      </div>
+      <p class="lead">Enter the password to continue</p>
+      <div class="error">{% if errormessage %}Wrong password{% endif %}</div>
+      <!-- A shared password has no user names; Panel only needs a non-empty one -->
+      <input type="hidden" name="username" value="prism">
+      <input type="password" name="password" placeholder="password" autocomplete="current-password" autofocus required>
+      <button type="submit">Log in</button>
+    </form>
+  </div>
+</body>
+</html>

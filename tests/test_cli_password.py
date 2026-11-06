@@ -108,13 +108,13 @@ def test_server_enforces_the_login(protected_server):
 
     # wrong password (any username is accepted, the password decides)
     s = requests.Session()
-    bad = s.post(url + "/login", data={"username": "x", "password": "wrong"}, allow_redirects=False, timeout=5)
+    bad = s.post(url + "/login", data={"username": "prism", "password": "wrong"}, allow_redirects=False, timeout=5)
     assert "error" in bad.headers.get("Location", "").lower() or bad.status_code in (401, 403)
     assert s.get(url + "/", allow_redirects=False, timeout=5).status_code in (301, 302, 303)
 
     # right password: the app is served
     s = requests.Session()
-    s.post(url + "/login", data={"username": "anyone", "password": "open-sesame"}, allow_redirects=False, timeout=5)
+    s.post(url + "/login", data={"username": "prism", "password": "open-sesame"}, allow_redirects=False, timeout=5)
     page = s.get(url + "/", timeout=5)
     assert page.status_code == 200 and "login" not in page.url
 
@@ -154,8 +154,35 @@ def test_websocket_is_behind_the_login_too():
     try:
         assert _websocket_handshake(port) == "rejected 403"
         s = requests.Session()
-        s.post(url + "/login", data={"username": "anyone", "password": "open-sesame"}, allow_redirects=False, timeout=5)
+        s.post(url + "/login", data={"username": "prism", "password": "open-sesame"}, allow_redirects=False, timeout=5)
         cookie = "; ".join(f"{c.name}={c.value}" for c in s.cookies)
         assert cookie and _websocket_handshake(port, cookie) == "accepted"
     finally:
         server.stop()
+
+
+def test_login_page_is_prisms_own_with_the_logo_and_only_asks_for_a_password(protected_server):
+    page = requests.get(protected_server + "/login", timeout=5).text
+    assert "PRISM" in page and "<svg" in page and 'aria-label="PRISM"' in page.replace("'", '"')
+    assert "logo_stacked" not in page and "Panel App" not in page   # Panel's own logo and title are gone
+    assert 'type="password"' in page and 'type="text"' not in page  # no user-name box
+    assert 'name="username" value="prism"' in page               # Panel needs a non-empty one
+
+    # what the browser would post from this form logs in
+    form = {"username": "prism", "password": "open-sesame"}
+    s = requests.Session()
+    s.post(protected_server + "/login", data=form, allow_redirects=False, timeout=5)
+    assert s.get(protected_server + "/", timeout=5).status_code == 200
+
+
+def test_the_logo_in_the_login_page_is_the_logo_file():
+    assets = cli.LOGIN_TEMPLATE.parent
+    logo = (assets / "logo.svg").read_text().strip()
+    assert logo in cli.LOGIN_TEMPLATE.read_text()
+    assert "<svg" in logo and "http" not in logo.replace("http://www.w3.org/2000/svg", "")  # self-contained
+
+
+def test_a_wrong_password_says_so_without_mentioning_a_user_name(protected_server):
+    page = requests.get(protected_server + "/login?error=Invalid+username+or+password%21", timeout=5).text
+    assert "Wrong password" in page and "username" not in page.replace('name="username"', "")
+    assert "Wrong password" not in requests.get(protected_server + "/login", timeout=5).text

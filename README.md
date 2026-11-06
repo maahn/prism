@@ -127,12 +127,11 @@ echo 'a-long-passphrase' > ~/.prism-password && chmod 600 ~/.prism-password
 prism --server --password-file ~/.prism-password --allow-websocket-origin prism.example.org
 ```
 
-Visitors then get a login page before anything else, including the
-websocket the app's data travels over. There is a single password for
-everyone; the login form also asks for a username, but **any non-empty
-username is accepted**. An unreadable or empty password file is an error
-(the server never silently starts without the password you asked for).
-Everyone has to log in again after the server restarts.
+Visitors then get a login page (PRISM's own, with its logo) before anything
+else, including the websocket the app's data travels over. There is a single
+password for everyone and no user names. An unreadable or empty password file
+is an error (the server never silently starts without the password you asked
+for). Everyone has to log in again after the server restarts.
 
 This is basic protection, not strong security: the password and the login
 cookie travel in clear text unless the connection is protected by something
