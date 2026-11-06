@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="260" alt="PRISM logo: a Doppler spectrum peak splitting a beam of light into colours"></p>
+
 # PRISM
 
 **P**rofiling & **R**emote-sensing **I**nteractive **S**pectra **M**onitor.
