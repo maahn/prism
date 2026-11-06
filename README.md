@@ -89,6 +89,7 @@ Then browse to `http://prism.example.org:5006/`.
 | `--allow-websocket-origin HOST[:PORT]` | The address users type into their browser, e.g. `prism.example.org` or `192.0.2.7:5006`. Repeatable. **Required for anyone but `localhost` to connect** -- otherwise the page loads but stays blank. `*` allows any origin (only do that behind something you trust). |
 | `--address ADDR` | Interface to listen on (default `0.0.0.0`, all interfaces). Use `127.0.0.1` when a reverse proxy on the same machine fronts PRISM. |
 | `--idle-timeout MINUTES` | Free a session's memory after this many minutes without activity (default `30`; `0` = never). |
+| `--password-file FILE` | Require a shared password (the first line of `FILE`) before anything is served. Also available as the `PRISM_PASSWORD` environment variable; the file wins if both are set. Works with and without `--server`. See "Password" below. |
 
 What differs from the default local mode:
 
@@ -114,10 +115,32 @@ What differs from the default local mode:
   server prune it yourself (for example a `cron` job deleting files under
   `$PRISM_CACHE` older than N days).
 
-There is no authentication. Put PRISM behind a reverse proxy or firewall if
-the server is reachable from anywhere you don't trust. Running it under
-`systemd` or in a container works like any other long-running Python
-process.
+### Password
+
+By default there is no authentication. Put PRISM behind a reverse proxy or
+firewall if the server is reachable from anywhere you don't trust, or turn on
+the built-in shared password:
+
+```bash
+echo 'a-long-passphrase' > ~/.prism-password && chmod 600 ~/.prism-password
+prism --server --password-file ~/.prism-password --allow-websocket-origin prism.example.org
+```
+
+Visitors then get a login page before anything else, including the
+websocket the app's data travels over. There is a single password for
+everyone; the login form also asks for a username, but **any non-empty
+username is accepted**. An unreadable or empty password file is an error
+(the server never silently starts without the password you asked for).
+Everyone has to log in again after the server restarts.
+
+This is basic protection, not strong security: the password and the login
+cookie travel in clear text unless the connection is protected by something
+else (an SSH tunnel, or a reverse proxy that terminates TLS), and there is no
+lockout after repeated wrong guesses. Choose a password that is not reused
+anywhere else.
+
+Running it under `systemd` or in a container works like any other
+long-running Python process.
 
 ## Shared data directories
 

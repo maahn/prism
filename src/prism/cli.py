@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import secrets
 
 import panel as pn
 
@@ -13,6 +14,36 @@ from prism import settings_store as ss
 from prism.app import build_app
 
 SERVER_DEFAULT_PORT = 5006
+PASSWORD_ENV = "PRISM_PASSWORD"
+
+
+def resolve_password(password_file: str | None, environ=os.environ) -> str | None:
+    """The shared password, from --password-file (first line) or, failing
+    that, the PRISM_PASSWORD environment variable. None = no password.
+    Raises ValueError for an unreadable or empty file."""
+    if password_file:
+        try:
+            with open(password_file, encoding="utf-8") as fh:
+                password = fh.readline().rstrip("\r\n")
+        except OSError as exc:
+            raise ValueError(f"cannot read --password-file {password_file}: {exc.strerror}") from exc
+        if not password:
+            raise ValueError(f"--password-file {password_file} is empty")
+        return password
+    return environ.get(PASSWORD_ENV) or None
+
+
+def auth_options(password: str | None) -> dict:
+    """pn.serve keyword arguments that put a login page in front of the app
+    (and its websocket) when a password is set; empty otherwise.
+
+    Panel's basic_auth takes the password itself rather than a file path --
+    a string that happens to name an existing file would be read as a JSON
+    user table -- and any username is accepted. The cookie secret is random
+    per start, so everyone has to log in again after a restart."""
+    if not password:
+        return {}
+    return {"basic_auth": password, "cookie_secret": secrets.token_hex(32)}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -24,6 +55,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="JSON file pointing sites at shared data directories "
                              '({"site_dirs": {"hyytiala": "/data/hyytiala/cloudnet"}}); '
                              "also PRISM_CONFIG. Disables the cache-size label and 'Clean cache'")
+    parser.add_argument("--password-file", default=None, metavar="FILE",
+                        help="require a shared password (the first line of FILE; any username) before "
+                             f"serving anything; also the {PASSWORD_ENV} environment variable. Sent in "
+                             "clear text unless the connection is protected by something else, e.g. an "
+                             "SSH tunnel or a TLS-terminating proxy")
     server = parser.add_argument_group(
         "server mode", "serve many users at once, each with an independent session")
     server.add_argument("--server", action="store_true",
@@ -48,6 +84,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(str(exc))
     if args.idle_timeout < 0:
         parser.error("--idle-timeout must be >= 0")
+    try:
+        args.password = resolve_password(args.password_file)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -57,7 +97,8 @@ def main(argv: list[str] | None = None) -> None:
         def build_local_session():
             return build_app(config=args.config_data)
 
-        pn.serve(build_local_session, port=args.port, show=not args.no_browser, title="PRISM")
+        pn.serve(build_local_session, port=args.port, show=not args.no_browser, title="PRISM",
+                 **auth_options(args.password))
         return
 
     # Files written into a shared data directory must stay writable by the
@@ -76,6 +117,8 @@ def main(argv: list[str] | None = None) -> None:
         return build_app(server_mode=True, idle_timeout_s=args.idle_timeout * 60,
                          config=args.config_data)
 
+    logging.getLogger(__name__).info(
+        "Password protection %s", "enabled" if args.password else "off (anyone who can reach the port can use PRISM)")
     pn.serve(
         build_session,
         port=port,
@@ -87,6 +130,7 @@ def main(argv: list[str] | None = None) -> None:
         # after a minute; connected-but-idle tabs are handled by the app.
         check_unused_sessions_milliseconds=15_000,
         unused_session_lifetime_milliseconds=60_000,
+        **auth_options(args.password),
     )
 
 
