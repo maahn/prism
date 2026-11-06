@@ -14,6 +14,7 @@ import gc
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable
 
 from prism import gridded_products as gp
@@ -24,6 +25,26 @@ DEFAULT_IDLE_TIMEOUT_S = 30 * 60
 
 _live_sessions = 0
 _live_lock = threading.Lock()
+
+# Decoding one raw hour holds several GB in memory (a dual-pol RPG hour peaks
+# in the tens of GB), so concurrent decodes -- from several users, or one user
+# hammering "Cache entire day" in many tabs -- could exhaust the RAM and take
+# the whole server (and anything else on the machine) down. Only this many run
+# at once; the rest wait.
+DEFAULT_MAX_DECODES = 1
+_decode_slots = threading.BoundedSemaphore(DEFAULT_MAX_DECODES)
+
+
+def set_decode_limit(n: int) -> None:
+    """Set how many decodes may run at once. Call before serving."""
+    global _decode_slots
+    _decode_slots = threading.BoundedSemaphore(max(1, int(n)))
+
+
+@contextmanager
+def decode_slot():
+    with _decode_slots:
+        yield
 
 
 def live_session_count() -> int:

@@ -201,6 +201,18 @@ def list_model_files(site: str, day: date) -> list[RemoteFile]:
     ]
 
 
+def check_path_component(name: str, what: str) -> str:
+    """Raise ValueError unless `name` is a single plain path component. A
+    site id, instrument or file name ends up inside a filesystem path, so
+    anything that could step out of its folder ("..", "/", "\\", an absolute
+    path) must never get that far, whatever the source of the name (a
+    widget value, the portal's API)."""
+    if (not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\\" in name
+            or "\0" in name):
+        raise ValueError(f"unsafe {what} for a file path: {name!r}")
+    return name
+
+
 PATH_PATTERN_TAIL = "/{product}/{year}/{file}"
 
 
@@ -232,6 +244,7 @@ def site_cache_dir(site: str, cache_dir: Path | None = None,
     Cloudnet id, "ny-alesund") and `{site_flat}` (hyphens and underscores
     removed, "nyalesund") substituted. New sites need no config change.
     3. Neither given: `<cache_dir>/sites/<site>` (default ~/.cache/prism)."""
+    check_path_component(site, "site id")
     pattern = (site_dirs or {}).get(site) or path_pattern
     if pattern:
         root = pattern[: -len(PATH_PATTERN_TAIL)]
@@ -252,8 +265,8 @@ def product_dir_name(remote: RemoteFile) -> str:
     `rpg-fmcw-94`, `hatpro-multi`, `weather-station`, `ecmwf`, ..."""
     m = _FILENAME_PREFIX.match(remote.filename)
     if m:
-        return _INSTRUMENT_PID_SUFFIX.sub("", m.group("rest"))
-    return remote.instrument_id or remote.product_id or "other"
+        return check_path_component(_INSTRUMENT_PID_SUFFIX.sub("", m.group("rest")), "product folder")
+    return check_path_component(remote.instrument_id or remote.product_id or "other", "product folder")
 
 
 def _year_of(remote: RemoteFile) -> str:
@@ -272,8 +285,10 @@ def cache_path_for(remote: RemoteFile, cache_dir: Path = DEFAULT_CACHE_DIR) -> P
     `raw/<instrument>/<YYYY>/<filename>`. Names are the plain Cloudnet
     filenames (no checksum prefix) so the tree is browsable and shareable;
     a download is considered valid when its size matches the portal's."""
+    check_path_component(remote.filename, "file name")
     if remote.kind == "raw":
-        return cache_dir / "raw" / (remote.instrument_id or "unknown") / _year_of(remote) / remote.filename
+        instrument = check_path_component(remote.instrument_id or "unknown", "instrument id")
+        return cache_dir / "raw" / instrument / _year_of(remote) / remote.filename
     return cache_dir / product_dir_name(remote) / _year_of(remote) / remote.filename
 
 
@@ -304,6 +319,7 @@ def find_existing(remote: RemoteFile, cache_dir: Path, any_size: bool = False) -
 def zarr_path_for(local_path: Path, cache_dir: Path, name: str) -> Path:
     """Decoded-spectra store for a raw file: `spectra_zarr/<instrument>/<YYYY>/<name>.zarr`,
     mirroring the raw file's own `raw/<instrument>/<YYYY>/` folder."""
+    check_path_component(name, "decoded-store name")
     try:
         rel_dir = local_path.parent.relative_to(cache_dir / "raw")
     except ValueError:
@@ -396,6 +412,13 @@ def _download_locked(remote, cache_dir, max_retries, on_progress, keep_existing=
                 mode = "ab" if existing else "wb"
                 with open(tmp, mode) as fh:
                     for chunk in resp.iter_content(chunk_size=1 << 20):
+                        if existing + len(chunk) > remote.size:
+                            # More than the portal said the file has: stop
+                            # rather than let a misbehaving server fill the disk.
+                            fh.close()
+                            tmp.unlink(missing_ok=True)
+                            raise ConnectionError(
+                                f"Server sent more than the expected {remote.size} bytes for {remote.filename}")
                         fh.write(chunk)
                         existing += len(chunk)
                         if on_progress:

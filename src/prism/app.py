@@ -199,16 +199,27 @@ class AppState(param.Parameterized):
         # file the first session is about to delete.
         with cc.path_lock(decoder._zarr_cache_path(local, self.cache_dir)):
             already_decoded = (decoder._zarr_cache_path(local, self.cache_dir) / "_SUCCESS").exists()
+            created_here = False
             if not already_decoded:
                 if on_status:
                     on_status(f"Downloading {remote.filename}...")
+                created_here = not local.is_file()
                 local = cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
                 if on_status:
                     on_status(f"Processing spectra ({self.instrument})...")
-            zpath = decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
-            if local.exists():
-                local.unlink()
+            with sm.decode_slot():
+                zpath = decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
+            if self._may_delete_raw(created_here):
+                local.unlink(missing_ok=True)
         return zpath
+
+    def _may_delete_raw(self, created_here: bool) -> bool:
+        """Whether the raw file may be deleted once it is decoded. In PRISM's
+        own cache it always may (only the much smaller decoded store is kept).
+        In a configured data archive only a file PRISM itself just downloaded
+        may be: one that was already there belongs to the archive, even though
+        it sits at the path PRISM would have used."""
+        return created_here or not self.settings.data_dirs_configured
 
     def load_hour(self, on_progress=None, on_status=None):
         """Downloads and decodes exactly ONE hour's raw spectra file -- the
@@ -259,7 +270,8 @@ class AppState(param.Parameterized):
         failed = 0
 
         def _download(remote):
-            return cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress)
+            created = not cc.cache_path_for(remote, self.cache_dir).is_file()
+            return cc.ensure_downloaded(remote, self.cache_dir, on_progress=on_progress), created
 
         with ThreadPoolExecutor(max_workers=1) as io_pool:
             next_future = io_pool.submit(_download, pending[0])
@@ -267,7 +279,7 @@ class AppState(param.Parameterized):
                 if on_status:
                     on_status(f"Caching spectra: hour {i + 1}/{len(pending)} ({remote.filename})...")
                 try:
-                    local = next_future.result()
+                    local, created_here = next_future.result()
                 except Exception:
                     failed += 1
                     local = None
@@ -280,9 +292,10 @@ class AppState(param.Parameterized):
                 try:
                     if on_status:
                         on_status(f"Processing spectra ({self.instrument}), hour {i + 1}/{len(pending)}...")
-                    decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
-                    if local.exists():
-                        local.unlink()
+                    with sm.decode_slot():
+                        decoder.ensure_decoded(local, self.cache_dir, on_status=on_status)
+                    if self._may_delete_raw(created_here):
+                        local.unlink(missing_ok=True)
                     newly_decoded += 1
                 except Exception:
                     failed += 1
@@ -1577,6 +1590,12 @@ def build_app(server_mode: bool = False,
     reset_all_btn.on_click(do_reset_all)
 
     def do_clean_cache(event):
+        # The button is only HIDDEN in server mode / with a configured data
+        # archive, and hiding is not access control: a client can still send
+        # a click for it. Refuse here, on the server.
+        if server_mode or settings.data_dirs_configured:
+            logger.warning("Refused 'Clean cache' (server mode or configured data archive)")
+            return
         status.object = "Clearing cache..."
         cc.clear_data_cache(state.cache_root)
         status.object = "Cache cleared. Click Load to re-download."

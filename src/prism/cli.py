@@ -75,6 +75,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     server.add_argument("--idle-timeout", type=float, default=sm.DEFAULT_IDLE_TIMEOUT_S / 60, metavar="MINUTES",
                         help="release a session's memory after this many minutes without user activity "
                              "(default: %(default)g; 0 = never)")
+    server.add_argument("--max-decodes", type=int, default=sm.DEFAULT_MAX_DECODES, metavar="N",
+                        help="decode at most N raw hours at once (default: %(default)d). Each decode holds "
+                             "several GB in memory, so more than the RAM allows can crash the server")
     args = parser.parse_args(argv)
     args.config_data = None
     if args.config:
@@ -84,6 +87,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(str(exc))
     if args.idle_timeout < 0:
         parser.error("--idle-timeout must be >= 0")
+    if args.max_decodes < 1:
+        parser.error("--max-decodes must be >= 1")
     try:
         args.password = resolve_password(args.password_file)
     except ValueError as exc:
@@ -93,6 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    sm.set_decode_limit(args.max_decodes)
     if not args.server:
         def build_local_session():
             return build_app(config=args.config_data)

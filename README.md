@@ -89,6 +89,7 @@ Then browse to `http://prism.example.org:5006/`.
 | `--allow-websocket-origin HOST[:PORT]` | The address users type into their browser, e.g. `prism.example.org` or `192.0.2.7:5006`. Repeatable. **Required for anyone but `localhost` to connect** -- otherwise the page loads but stays blank. `*` allows any origin (only do that behind something you trust). |
 | `--address ADDR` | Interface to listen on (default `0.0.0.0`, all interfaces). Use `127.0.0.1` when a reverse proxy on the same machine fronts PRISM. |
 | `--idle-timeout MINUTES` | Free a session's memory after this many minutes without activity (default `30`; `0` = never). |
+| `--max-decodes N` | Decode at most `N` raw hours at once (default `1`; the others wait). One decode holds several GB in memory, so more concurrent decodes than the RAM allows could crash the server. |
 | `--password-file FILE` | Require a shared password (the first line of `FILE`) before anything is served. Also available as the `PRISM_PASSWORD` environment variable; the file wins if both are set. Works with and without `--server`. See "Password" below. |
 
 What differs from the default local mode:
@@ -138,6 +139,23 @@ cookie travel in clear text unless the connection is protected by something
 else (an SSH tunnel, or a reverse proxy that terminates TLS), and there is no
 lockout after repeated wrong guesses. Choose a password that is not reused
 anywhere else.
+
+### What a visitor can do
+
+The server never runs anything a visitor sends and never lets one choose a
+file path: sites, instruments and dates are validated against the options
+shown, and every name that ends up in a path is checked to be a single plain
+file name. The cache can only be cleared from a single-user session (the
+button is not merely hidden in server mode, the server refuses the request),
+a configured data archive is never cleaned, and a raw file that was already in
+an archive is not deleted after decoding. Downloads stop at the size the
+portal announced.
+
+What remains is what the app is for: a visitor can make the server download
+and decode data, which **fills the disk** (the cache only grows; see above)
+and uses CPU and bandwidth, and a few visitors decoding at once will queue
+behind `--max-decodes`. Use a password, or keep the port reachable only from
+networks you trust, if that matters to you.
 
 Running it under `systemd` or in a container works like any other
 long-running Python process.
